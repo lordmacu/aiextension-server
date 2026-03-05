@@ -1,0 +1,11 @@
+node_modules/
+conversations/
+images/
+current-conversation.json
+prompt.json
+stories.json
+*.bak
+*.bak2
+*.bak3
+*.bak_final
+.env
