@@ -257,6 +257,33 @@ Successful response:
 }
 ```
 
+### Sending images (vision)
+
+The `content` field of a user message can be an array of parts instead of a plain string. Use the OpenAI vision format to attach images as base64 data URLs:
+
+```bash
+curl -X POST https://your-domain.com/ai/v1/chat/completions \
+  -H "X-Api-Key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4.1",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "What do you see in this image?" },
+          { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgo..." } }
+        ]
+      }
+    ],
+    "stream": false
+  }'
+```
+
+The server extracts the base64 URLs and forwards them to the VS Code extension, which sends them to Copilot as `LanguageModelDataPart` objects (native vision format).
+
+> **Note:** Image support depends on the underlying Copilot model. `gpt-4.1` and `gpt-4o` support vision.
+
 ### Additional parameters (custom extensions)
 
 | Parameter | Type | Description |

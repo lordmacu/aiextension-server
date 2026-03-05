@@ -346,7 +346,8 @@ app.get('/docs', (req, res) => {
                   justification: { type: 'string', nullable: true },
                   modelOptions: { type: 'object', nullable: true },
                   systemPrompt: { type: 'string', nullable: true },
-                  maxInputTokens: { type: 'integer', nullable: true }
+                  maxInputTokens: { type: 'integer', nullable: true },
+                  images: { type: 'array', nullable: true, description: 'Data URLs base64 de imagenes adjuntas (data:image/png;base64,...)', items: { type: 'string' } }
                 }
               }}}
             }
@@ -420,7 +421,8 @@ app.get('/docs', (req, res) => {
               justification:{ type: 'string' },
               modelOptions: { type: 'object' },
               systemPrompt: { type: 'string' },
-              maxInputTokens: { type: 'integer' }
+              maxInputTokens: { type: 'integer' },
+              images: { type: 'array', description: 'Data URLs base64 de imagenes (data:image/png;base64,...)', items: { type: 'string' } }
             }}}}
           },
           responses: {
@@ -443,10 +445,28 @@ app.get('/docs', (req, res) => {
             required: true,
             content: { 'application/json': { schema: { type: 'object', required: ['messages'], properties: {
               model:                  { type: 'string', example: 'gpt-4.1' },
-              messages:               { type: 'array', items: { type: 'object', properties: {
-                role:    { type: 'string', enum: ['system', 'user', 'assistant'] },
-                content: { type: 'string' }
-              }}},
+              messages: {
+                type: 'array',
+                description: 'El campo `content` del mensaje de usuario puede ser un string o un array de partes (texto + imagenes). Para enviar imagenes usar el formato OpenAI vision.',
+                items: { type: 'object', properties: {
+                  role: { type: 'string', enum: ['system', 'user', 'assistant'] },
+                  content: {
+                    oneOf: [
+                      { type: 'string', description: 'Texto plano' },
+                      { type: 'array', description: 'Array de partes para mensajes con imagenes', items: {
+                        type: 'object',
+                        properties: {
+                          type: { type: 'string', enum: ['text', 'image_url'] },
+                          text: { type: 'string', description: 'Solo cuando type=text' },
+                          image_url: { type: 'object', description: 'Solo cuando type=image_url', properties: {
+                            url: { type: 'string', description: 'Data URL base64: data:image/png;base64,...' }
+                          }}
+                        }
+                      }}
+                    ]
+                  }
+                }}
+              },
               temperature:            { type: 'number' },
               top_p:                  { type: 'number' },
               max_tokens:             { type: 'integer' },
