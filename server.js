@@ -1146,7 +1146,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
 
     console.log(`[v1] /chat/completions model=${data.modelFamily} thread=${conversationId || 'new'}`);
-    return await executePromptRequest(data, wrapResForV1(res, data.modelFamily, Date.now()));
+    return await executePromptRequest(data, wrapResForV1(res, data.modelFamily, Date.now(), prompt));
 
   } catch (error) {
     console.error('[v1] Error en /chat/completions:', error);
@@ -1155,7 +1155,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 // Envuelve res de Express para que executePromptRequest devuelva formato OpenAI
-function wrapResForV1(res, modelId, startTime) {
+function wrapResForV1(res, modelId, startTime, promptText) {
   return {
     status(code) {
       res.status(code);
@@ -1171,6 +1171,8 @@ function wrapResForV1(res, modelId, startTime) {
                         ?? body.message
                         ?? '';
         const convId  = conv?.id ?? null;
+        const promptTokens     = Math.ceil((promptText || '').length / 4);
+        const completionTokens = Math.ceil(content.length / 4);
         return res.json({
           id:      `chatcmpl-${startTime}`,
           object:  'chat.completion',
@@ -1178,7 +1180,7 @@ function wrapResForV1(res, modelId, startTime) {
           model:   modelId || 'gpt-4.1',
           thread_id: convId,
           choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-          usage:   { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+          usage:   { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
         });
       }
       return res.json(body);
