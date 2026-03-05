@@ -12,9 +12,9 @@ const PORT = process.env.PORT || 54321;
 const API_KEY = process.env.AI_API_KEY || 'finearom-ai-2025';
 
 // ─── Timeouts ────────────────────────────────────────────────────────────────
-const PROCESSING_TIMEOUT = 3 * 60 * 1000; // 3min — máximo para que la extensión responda
-const HTTP_TIMEOUT       = 2 * 60 * 1000; // 2min — máximo que el caller espera colgado
-const WORKER_WAIT_TIMEOUT = 30 * 1000;    // 30s — long-poll worker espera
+const PROCESSING_TIMEOUT  = 5 * 60 * 1000; // 5min — máximo para que la extensión responda
+const HTTP_TIMEOUT        = 4 * 60 * 1000; // 4min — máximo que el caller espera colgado
+const WORKER_WAIT_TIMEOUT = 30 * 1000;     // 30s — long-poll worker espera
 
 // ─── Estado paralelo ─────────────────────────────────────────────────────────
 // Prompts esperando que un worker de la extensión los tome (FIFO exclusivo)
