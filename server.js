@@ -447,7 +447,7 @@ app.get('/docs', (req, res) => {
         post: {
           tags: ['OpenAI-compatible'],
           summary: 'Chat Completions (OpenAI-compatible)',
-          description: 'Endpoint principal. Compatible con la libreria openai: cambia `baseURL` y `apiKey` apuntando a este servidor.\n\n**Extensiones propias:**\n- `thread_id` — continuar conversacion existente (equivale a `conversationId`)\n- `justification` — instruccion extra para el modelo\n- `extract_json` — extrae JSON de la respuesta\n- `save_last_message_only` — no guarda el historial, solo el ultimo mensaje\n- `max_input_tokens` — limita tokens de entrada',
+          description: 'Endpoint principal. Compatible con la libreria openai: cambia `baseURL` y `apiKey` apuntando a este servidor.\n\n**Extensiones propias:**\n- `thread_id` — continuar conversacion existente (equivale a `conversationId`)\n- `justification` — instruccion extra para el modelo\n- `extract_json` — extrae JSON de la respuesta\n- `save_last_message_only` — no guarda el historial, solo el ultimo mensaje\n- `max_input_tokens` — limita tokens de entrada\n- `tools` — array de tool definitions (formato OpenAI). Cuando Copilot quiera ejecutar un tool, hacer long-poll a `GET /api/tool/wait/:convId` y enviar resultado con `POST /api/tool/result/:callId`',
           requestBody: {
             required: true,
             content: { 'application/json': { schema: { type: 'object', required: ['messages'], properties: {
@@ -482,7 +482,15 @@ app.get('/docs', (req, res) => {
               justification:          { type: 'string' },
               extract_json:           { type: 'boolean', default: false },
               save_last_message_only: { type: 'boolean', default: false },
-              max_input_tokens:       { type: 'integer' }
+              max_input_tokens:       { type: 'integer' },
+              tools: { type: 'array', description: 'Tool definitions (OpenAI format). Habilita function calling en Copilot.', items: { type: 'object', properties: {
+                type: { type: 'string', enum: ['function'] },
+                function: { type: 'object', properties: {
+                  name:        { type: 'string' },
+                  description: { type: 'string' },
+                  parameters:  { type: 'object', description: 'JSON Schema de los argumentos' }
+                }}
+              }}}
             }}}}
           },
           responses: {

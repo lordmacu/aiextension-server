@@ -284,6 +284,169 @@ The server extracts the base64 URLs and forwards them to the VS Code extension, 
 
 > **Note:** Image support depends on the underlying Copilot model. `gpt-4.1` and `gpt-4o` support vision.
 
+### Tool Calling (function calling)
+
+Pass a `tools` array in the same format as the OpenAI API. Copilot will call your tools when it needs real data to answer the prompt. Your app executes the tool locally and returns the result — then Copilot generates the final response with real data.
+
+```
+POST /v1/chat/completions  (with tools[])
+  ↓
+Copilot decides to call a tool
+  ↓
+GET  /api/tool/wait/:convId     ← your app long-polls (30s)
+POST /api/tool/result/:callId   ← your app sends the result
+  ↓
+Copilot generates final answer
+```
+
+**Python example — query database using tools:**
+
+```python
+import requests, time
+
+BASE  = "https://your-domain.com/ai"
+KEY   = "YOUR_KEY"
+HEADS = {"X-Api-Key": KEY, "Content-Type": "application/json"}
+
+# 1. Define your tools (same format as OpenAI)
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_client_orders",
+            "description": "Returns the total number of orders for a client",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "integer", "description": "The client's ID"}
+                },
+                "required": ["client_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_client_balance",
+            "description": "Returns the outstanding balance for a client in USD",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "integer"}
+                },
+                "required": ["client_id"]
+            }
+        }
+    }
+]
+
+# 2. Send the prompt — response may not arrive until all tools are resolved
+conv_id = "client-report-42"
+requests.post(f"{BASE}/v1/chat/completions", headers=HEADS, json={
+    "model": "gpt-4.1",
+    "messages": [{"role": "user", "content": "Give me a summary for client 42"}],
+    "stream": False,
+    "thread_id": conv_id,
+    "tools": tools
+})
+# Note: this request blocks until Copilot finishes (all tool calls resolved)
+# Run it in a background thread and handle tools in the main thread:
+
+# 3. Handle tool calls in a loop
+while True:
+    r = requests.get(f"{BASE}/api/tool/wait/{conv_id}", headers=HEADS).json()
+    if not r.get("callId"):
+        break  # no pending tool calls
+
+    call_id = r["callId"]
+    name    = r["name"]
+    args    = r["input"]
+
+    # 4. Execute the tool locally with your real data
+    if name == "get_client_orders":
+        result = str(db.query_scalar(
+            "SELECT COUNT(*) FROM orders WHERE client_id = %s", args["client_id"]
+        ))
+    elif name == "get_client_balance":
+        result = str(db.query_scalar(
+            "SELECT SUM(amount) FROM invoices WHERE client_id = %s AND paid = 0",
+            args["client_id"]
+        ))
+    else:
+        result = "Unknown tool"
+
+    # 5. Return result to server → extension → Copilot
+    requests.post(f"{BASE}/api/tool/result/{call_id}", headers=HEADS,
+                  json={"result": result})
+```
+
+**Laravel (PHP) example:**
+
+```php
+use Illuminate\Support\Facades\Http;
+
+$convId = 'client-report-' . $clientId;
+$tools  = [
+    [
+        'type'     => 'function',
+        'function' => [
+            'name'        => 'get_client_orders',
+            'description' => 'Returns total orders count for a client',
+            'parameters'  => [
+                'type'       => 'object',
+                'properties' => ['client_id' => ['type' => 'integer']],
+                'required'   => ['client_id'],
+            ],
+        ],
+    ],
+];
+
+// Start prompt in background (it blocks until tools are resolved)
+dispatch(function () use ($convId, $tools, $clientId) {
+    Http::withHeaders(['X-Api-Key' => config('ai.key')])
+        ->timeout(300)
+        ->post(config('ai.url') . '/v1/chat/completions', [
+            'model'     => 'gpt-4.1',
+            'messages'  => [['role' => 'user', 'content' => "Summarize client {$clientId}"]],
+            'stream'    => false,
+            'thread_id' => $convId,
+            'tools'     => $tools,
+        ]);
+});
+
+// Handle tool calls in the main flow
+while (true) {
+    $tc = Http::withHeaders(['X-Api-Key' => config('ai.key')])
+        ->timeout(35)
+        ->get(config('ai.url') . "/api/tool/wait/{$convId}")
+        ->json();
+
+    if (empty($tc['callId'])) { break; } // no pending calls
+
+    $result = match ($tc['name']) {
+        'get_client_orders' => (string) Order::where('client_id', $tc['input']['client_id'])->count(),
+        default             => 'Unknown tool',
+    };
+
+    Http::withHeaders(['X-Api-Key' => config('ai.key')])
+        ->post(config('ai.url') . "/api/tool/result/{$tc['callId']}", [
+            'result' => $result,
+        ]);
+}
+
+// At this point the prompt has completed — read the result
+$conv = Http::withHeaders(['X-Api-Key' => config('ai.key')])
+    ->get(config('ai.url') . "/v1/threads/{$convId}/messages")
+    ->json();
+$answer = collect($conv['data'])->where('role', 'assistant')->last()['content'][0]['text']['value'];
+```
+
+**Use cases:**
+- Query your database on demand (orders, clients, inventory, balances)
+- Call external APIs (weather, exchange rates, shipping tracking)
+- Run calculations or data transformations in your own backend
+- Read files or generate dynamic reports
+
 ### Additional parameters (custom extensions)
 
 | Parameter | Type | Description |
@@ -293,6 +456,7 @@ The server extracts the base64 URLs and forwards them to the VS Code extension, 
 | `extract_json` | bool | Automatically extract JSON from the response |
 | `save_last_message_only` | bool | Do not save history, only the last message |
 | `max_input_tokens` | int | Limit input tokens |
+| `tools` | array | Tool definitions (OpenAI function-calling format) |
 
 ### Available models
 
@@ -372,6 +536,17 @@ $content = $response->json('choices.0.message.content');
 ## Admin Endpoints
 
 ```bash
+# ── Tool calling ──────────────────────────────────────────────────────────────
+# App long-polls for pending tool calls for a conversation (30s)
+GET  /api/tool/wait/:convId               X-Api-Key required
+# -> { callId, name, input }  OR  { callId: null }  (timeout)
+
+# App submits tool execution result
+POST /api/tool/result/:callId             X-Api-Key required
+     {"result": "42"}                     # success
+     {"error": "DB connection failed"}    # error
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
 # Server status (workers, queue, connections)
 GET  /api/status                          X-Api-Key required
 
