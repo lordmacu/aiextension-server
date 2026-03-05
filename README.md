@@ -45,7 +45,7 @@ cp .env.example .env
 | Variable | Default | Descripcion |
 |----------|---------|-------------|
 | `PORT` | `54321` | Puerto del servidor |
-| `AI_API_KEY` | `finearom-ai-2025` | API key para autenticar requests |
+| `AI_API_KEY` | `YOUR_KEY` | API key para autenticar requests |
 
 ### 3. Levantar
 
@@ -175,13 +175,15 @@ En VS Code -> Configuracion -> buscar `aiRunner`:
 | Setting | Valor |
 |---------|-------|
 | `aiRunner.serverUrl` | `https://tu-dominio.com/ai` |
-| `aiRunner.apiKey` | `finearom-ai-2025` (o tu clave) |
+| `aiRunner.apiKey` | `YOUR_KEY` (o tu clave) |
 
 ---
 
 ## Extension VS Code
 
 La extension ejecuta los prompts en GitHub Copilot. Sin ella el servidor recibe requests pero no puede procesarlos.
+
+**Repositorio: [vscode-ai-extension →](https://github.com/lordmacu/vscode-ai-extension)**
 
 ### Instalar la extension
 
@@ -198,7 +200,7 @@ Recargar VS Code (`Cmd+Shift+P` -> Reload Window) y hacer clic en **Iniciar** en
 Con la extension activa, el servidor debe mostrar workers conectados:
 
 ```bash
-curl -H "X-Api-Key: finearom-ai-2025" http://localhost:54321/api/status
+curl -H "X-Api-Key: YOUR_KEY" http://localhost:54321/api/status
 # -> {"active":0,"queued":0,"workers":3,"wsClients":1,"pendingResolvers":0}
 #                                              ^
 #                                              3 workers listos
@@ -212,7 +214,7 @@ curl -H "X-Api-Key: finearom-ai-2025" http://localhost:54321/api/status
 
 ```
 POST /v1/chat/completions
-X-Api-Key: finearom-ai-2025
+X-Api-Key: YOUR_KEY
 Content-Type: application/json
 ```
 
@@ -228,7 +230,17 @@ Content-Type: application/json
 }
 ```
 
-Respuesta:
+### Comportamiento de la respuesta
+
+| Escenario | HTTP | Body |
+|-----------|------|------|
+| Extension activa, prompt procesado en < 30s | `200` | `{ choices[0].message.content }` |
+| Sin extension disponible en 30s | `202` | `{ accepted, conversationId, polling_url }` |
+| Error de procesamiento | `500` | `{ error: "..." }` |
+
+Cuando recibes `202`, el prompt sigue en cola (hasta 5 minutos). Pollea `GET /api/conversations/:conversationId` para obtener el resultado cuando la extension lo procese.
+
+Respuesta exitosa:
 
 ```json
 {
@@ -259,7 +271,7 @@ Respuesta:
 
 ```bash
 GET /v1/models
-X-Api-Key: finearom-ai-2025
+X-Api-Key: YOUR_KEY
 ```
 
 Modelos soportados via Copilot:
@@ -279,7 +291,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="https://tu-dominio.com/ai/v1",
-    api_key="finearom-ai-2025"
+    api_key="YOUR_KEY"
 )
 
 response = client.chat.completions.create(
@@ -297,7 +309,7 @@ import OpenAI from 'openai';
 
 const client = new OpenAI({
   baseURL: 'https://tu-dominio.com/ai/v1',
-  apiKey: 'finearom-ai-2025'
+  apiKey: 'YOUR_KEY'
 });
 
 const response = await client.chat.completions.create({
@@ -315,7 +327,7 @@ console.log(response.choices[0].message.content);
 use Illuminate\Support\Facades\Http;
 
 $response = Http::withHeaders([
-    'X-Api-Key' => 'finearom-ai-2025',
+    'X-Api-Key' => 'YOUR_KEY',
 ])->post('https://tu-dominio.com/ai/v1/chat/completions', [
     'model'     => 'gpt-4.1',
     'messages'  => [
@@ -363,14 +375,28 @@ POST /api/prompt/clear                    X-Api-Key requerido
 
 El servidor soporta cola infinita. La extension procesa **3 conversaciones en paralelo** por defecto.
 
-```
-Servidor (cola FIFO)
-  promptQueue: [A, B, C, D, ...]
-       |
-       |---> Worker 0 --> procesa A --> vuelve a esperar
-       |---> Worker 1 --> procesa B --> vuelve a esperar
-       +---> Worker 2 --> procesa C --> vuelve a esperar
-                          D espera en cola hasta que un worker termine
+```mermaid
+sequenceDiagram
+    participant W0 as Worker 0
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant S as Server
+
+    par Workers register
+        W0->>S: GET /api/prompt/wait
+        W1->>S: GET /api/prompt/wait
+        W2->>S: GET /api/prompt/wait
+    end
+
+    Note over S: new prompt arrives
+
+    S-->>W0: prompt conv_A
+    Note over W0: processes via Copilot
+    S-->>W1: timeout - re-polls
+    S-->>W2: timeout - re-polls
+
+    W0->>S: POST /api/save response
+    W0->>S: GET /api/prompt/wait
 ```
 
 Para aumentar el paralelismo cambiar `WORKER_COUNT = 3` en `src/poller.ts` de la extension (requiere reconstruir e instalar la extension).
@@ -400,16 +426,31 @@ Los directorios `conversations/` e `images/` se montan como volumenes en Docker,
 | Timeout | Valor | Descripcion |
 |---------|-------|-------------|
 | `PROCESSING_TIMEOUT` | 5 min | Maximo para que la extension responda |
-| `HTTP_TIMEOUT` | 4 min | Maximo que el caller HTTP espera |
+| `HTTP_TIMEOUT` | 30 s | Maximo que el caller HTTP espera antes de recibir 202 |
 | `WORKER_WAIT_TIMEOUT` | 30 s | Long-poll del worker antes de reintentar |
 | Extension (Copilot) | 2 min | Timeout interno por prompt en la extension |
+
+```mermaid
+flowchart LR
+    A["Caller envia request"] --> B["Server encola prompt"]
+    B --> C{"Worker toma el prompt\nen menos de 30s?"}
+    C -->|Si| D["Copilot ejecuta\nhasta 120s"]
+    C -->|No| E["202 Accepted\ncaller pollea /api/conversations/:id"]
+    D --> F{"Copilot responde\nen menos de 5 min?"}
+    E --> F
+    F -->|Si| G["200 al caller"]
+    F -->|No| H["PROCESSING_TIMEOUT\nconversacion descartada"]
+    style E fill:#f0ad4e,color:#000
+    style H fill:#d9534f,color:#fff
+    style G fill:#5cb85c,color:#fff
+```
 
 ---
 
 ## Troubleshooting
 
 **Error `401 Unauthorized`**
-Falta el header de autenticacion. Agregar: `X-Api-Key: finearom-ai-2025`
+Falta el header de autenticacion. Agregar: `X-Api-Key: YOUR_KEY`
 
 **El caller queda colgado sin respuesta**
 La extension VS Code no esta corriendo o no tiene workers activos. Verificar en VS Code que el panel AI Runner este en estado activo y muestre workers.
