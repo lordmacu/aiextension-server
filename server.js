@@ -185,7 +185,8 @@ function dispatchNextToWorker() {
 // Encola el prompt, espera a que la extensión lo procese y devuelva respuesta.
 async function executePromptRequest(data, res) {
   if (!data.id) { data.id = generateConversationId(); }
-  const convId = data.id;
+  const convId = String(data.id); // siempre string — evita mismatch numérico en pendingResolvers
+  data.id = convId;
 
   activeCount++;
   broadcastStatus();
