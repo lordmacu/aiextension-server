@@ -912,7 +912,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       return res.status(400).json({ error: { message: 'At least one user message is required', type: 'invalid_request_error' } });
     }
 
-    const prompt = typeof lastUser.content === 'string' ? lastUser.content : lastUser.content?.map(p => p.text || '').join('');
+    const contentParts = Array.isArray(lastUser.content) ? lastUser.content : null;
+    const prompt = contentParts
+      ? contentParts.filter(p => p.type === 'text').map(p => p.text || '').join('')
+      : (lastUser.content || '');
+    const images = contentParts
+      ? contentParts.filter(p => p.type === 'image_url').map(p => p.image_url?.url).filter(Boolean)
+      : [];
 
     const modelOptions = {};
     if (temperature !== undefined) { modelOptions.temperature = temperature; }
@@ -935,6 +941,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       modelOptions:         Object.keys(modelOptions).length ? modelOptions : null,
       systemPrompt:         systemPrompt,
       maxInputTokens:       max_input_tokens || null,
+      images:               images.length ? images : undefined,
     };
 
     console.log(`[v1] /chat/completions model=${data.modelFamily} thread=${conversationId || 'new'}`);
