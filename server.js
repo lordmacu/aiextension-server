@@ -14,53 +14,34 @@ const API_KEY = process.env.AI_API_KEY || 'finearom-ai-2025';
 // ─── Timeouts ────────────────────────────────────────────────────────────────
 const PROCESSING_TIMEOUT = 3 * 60 * 1000; // 3min — máximo para que la extensión responda
 const HTTP_TIMEOUT       = 2 * 60 * 1000; // 2min — máximo que el caller espera colgado
+const WORKER_WAIT_TIMEOUT = 30 * 1000;    // 30s — long-poll worker espera
 
-// ─── Estado global ───────────────────────────────────────────────────────────
-let isProcessing = false;
-let currentTaskId = null;
-let processingStartTime = null;
+// ─── Estado paralelo ─────────────────────────────────────────────────────────
+// Prompts esperando que un worker de la extensión los tome (FIFO exclusivo)
+const promptQueue = [];
 
-// ─── Estado del prompt en memoria (evita readFileSync en cada poll) ──────────
-const EMPTY_PROMPT = { prompt: '', newChat: true, saveLastMessageOnly: false, id: null, extractJson: false, isImage: false, focused: false, modelFamily: null, justification: null, modelOptions: null, systemPrompt: null, maxInputTokens: null };
-let promptState = { ...EMPTY_PROMPT };
+// Workers de la extensión en long-polling esperando trabajo
+const waitingWorkers = [];
 
-// ─── Cola de requests ────────────────────────────────────────────────────────
-const requestQueue = [];
+// Resolvers por conversationId → { resolve, reject, timeoutId }
+const pendingResolvers = new Map();
 
-// ─── Long-polling: clientes esperando un nuevo prompt ────────────────────────
-const waitingClients = [];
+// Contador de requests activos (en manos de un worker)
+let activeCount = 0;
 
 // ─── WebSocket clients ───────────────────────────────────────────────────────
 const wsClients = new Set();
 
-// ─── Resolvers pendientes por taskId ─────────────────────────────────────────
-// taskId -> { resolve, reject, timeoutId }
-// Cuando /api/save llega, se resuelven todos (siempre hay máximo uno activo)
-const pendingResolvers = new Map();
-
 // ─── Archivos y directorios ──────────────────────────────────────────────────
-const PROMPT_FILE       = path.join(__dirname, 'prompt.json');
 const CURRENT_CONV_FILE = path.join(__dirname, 'current-conversation.json');
 const CONVERSATIONS_DIR = path.join(__dirname, 'conversations');
 const IMAGES_DIR        = path.join(__dirname, 'images');
 
-// Inicializar dirs y leer estado inicial desde disco
+// Inicializar dirs
 if (!fs.existsSync(CONVERSATIONS_DIR)) { fs.mkdirSync(CONVERSATIONS_DIR); }
 if (!fs.existsSync(IMAGES_DIR))        { fs.mkdirSync(IMAGES_DIR); }
 if (!fs.existsSync(CURRENT_CONV_FILE)) {
   fs.writeFileSync(CURRENT_CONV_FILE, JSON.stringify({ conversationId: null }, null, 2));
-}
-if (fs.existsSync(PROMPT_FILE)) {
-  try { promptState = { ...EMPTY_PROMPT, ...JSON.parse(fs.readFileSync(PROMPT_FILE, 'utf8')) }; }
-  catch (e) { writePromptState(EMPTY_PROMPT); }
-} else {
-  fs.writeFileSync(PROMPT_FILE, JSON.stringify(EMPTY_PROMPT, null, 2));
-}
-
-// Escribe en disco Y actualiza memoria
-function writePromptState(data) {
-  promptState = { ...EMPTY_PROMPT, ...data };
-  fs.writeFileSync(PROMPT_FILE, JSON.stringify(promptState, null, 2));
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -80,22 +61,6 @@ app.use('/api', (req, res, next) => {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function generateConversationId() {
   return `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
-function resetProcessingState() {
-  isProcessing = false;
-  currentTaskId = null;
-  processingStartTime = null;
-}
-
-function checkAndResetTimeout() {
-  if (isProcessing && processingStartTime && (Date.now() - processingStartTime > PROCESSING_TIMEOUT)) {
-    console.log('⚠️ TIMEOUT global - reseteando estado...');
-    resetProcessingState();
-    processNextInQueue();
-    return true;
-  }
-  return false;
 }
 
 function isBase64Image(text) {
@@ -190,127 +155,82 @@ function extractJsonFromText(text) {
   return text;
 }
 
-function wsBroadcastPrompt(data) {
+// Envía estado del servidor a todos los WS conectados
+function broadcastStatus() {
   if (wsClients.size === 0) { return; }
   const msg = JSON.stringify({
-    type: 'prompt',
-    prompt: data.prompt || '',
-    newChat: data.newChat !== false,
-    saveLastMessageOnly: data.saveLastMessageOnly || false,
-    id: data.id || null,
-    extractJson: data.extractJson || false,
-    isProcessing: true,
-    taskId: currentTaskId,
-    modelFamily:    data.modelFamily    || null,
-    justification:  data.justification  || null,
-    modelOptions:   data.modelOptions   || null,
-    systemPrompt:   data.systemPrompt   || null,
-    maxInputTokens: data.maxInputTokens || null,
+    type: 'status',
+    active: activeCount,
+    queued: promptQueue.length,
+    workers: waitingWorkers.length
   });
-  console.log(`🔌 WS: broadcasting prompt a ${wsClients.size} cliente(s)`);
   for (const ws of wsClients) {
     if (ws.readyState === 1) { ws.send(msg); }
   }
 }
 
-function notifyWaitingClients(data) {
-  if (waitingClients.length === 0) { return; }
-  console.log(`📡 Notificando a ${waitingClients.length} clientes en espera (long-poll)`);
-  const payload = {
-    prompt: data.prompt || '',
-    newChat: data.newChat !== false,
-    saveLastMessageOnly: data.saveLastMessageOnly || false,
-    id: data.id || null,
-    extractJson: data.extractJson || false,
-    isProcessing,
-    taskId: currentTaskId
-  };
-  while (waitingClients.length > 0) {
-    const { res, timer } = waitingClients.shift();
+// Despacha el siguiente prompt de la cola al primer worker disponible (exclusivo)
+function dispatchNextToWorker() {
+  while (promptQueue.length > 0 && waitingWorkers.length > 0) {
+    const prompt = promptQueue.shift();
+    const { res, timer } = waitingWorkers.shift();
     clearTimeout(timer);
-    res.json(payload);
+    console.log(`📡 Dispatch prompt → worker. Queue restante: ${promptQueue.length}, Workers: ${waitingWorkers.length}`);
+    res.json(prompt);
+    broadcastStatus();
   }
-}
-
-function processNextInQueue() {
-  if (isProcessing || requestQueue.length === 0) { return; }
-  const next = requestQueue.shift();
-  console.log(`📋 Procesando siguiente en cola. Restantes: ${requestQueue.length}`);
-  executePromptRequest(next.data, next.res);
-}
-
-// Resuelve TODOS los resolvers pendientes (siempre hay máximo uno).
-// Se llama desde /api/save cuando la extensión termina exitosamente.
-function resolveAllPending() {
-  if (pendingResolvers.size === 0) { return false; }
-  for (const [taskId, pending] of pendingResolvers.entries()) {
-    clearTimeout(pending.timeoutId);
-    pending.resolve();
-    pendingResolvers.delete(taskId);
-  }
-  return true;
 }
 
 // ─── Lógica central ───────────────────────────────────────────────────────────
+// Encola el prompt, espera a que la extensión lo procese y devuelva respuesta.
 async function executePromptRequest(data, res) {
-  writePromptState(data);
+  if (!data.id) { data.id = generateConversationId(); }
+  const convId = data.id;
 
-  isProcessing = true;
-  currentTaskId = Date.now();
-  processingStartTime = Date.now();
-  const capturedTaskId = currentTaskId;
+  activeCount++;
+  broadcastStatus();
+  console.log(`🔒 Encolando prompt convId=${convId} (activos=${activeCount}, cola=${promptQueue.length})`);
 
-  console.log(`🔒 Procesando prompt (Task ID: ${capturedTaskId}, Cola: ${requestQueue.length})`);
-
-  notifyWaitingClients(data);
-  wsBroadcastPrompt(data);
+  promptQueue.push(data);
+  dispatchNextToWorker();
 
   let responded = false;
 
   const httpTimeout = setTimeout(() => {
     if (!responded) {
       responded = true;
-      console.warn(`⏱ HTTP timeout (2min) Task ID: ${capturedTaskId} — respondiendo 504`);
-      res.status(504).json({ error: 'Timeout: la IA no respondió en 2 minutos. La tarea sigue procesándose en segundo plano.' });
+      console.warn(`⏱ HTTP timeout convId=${convId} — respondiendo 504`);
+      res.status(504).json({ error: 'Timeout: la IA no respondió en 2 minutos. La tarea sigue procesándose.' });
     }
   }, HTTP_TIMEOUT);
 
   try {
     await new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
-        if (pendingResolvers.has(capturedTaskId)) {
-          pendingResolvers.delete(capturedTaskId);
-          console.warn(`⏱ PROCESSING_TIMEOUT (3min) Task ID: ${capturedTaskId}`);
-          resetProcessingState();
-          processNextInQueue();
+        if (pendingResolvers.has(convId)) {
+          pendingResolvers.delete(convId);
+          // También remover de la cola si aún no fue tomado
+          const idx = promptQueue.findIndex(p => p.id === convId);
+          if (idx > -1) { promptQueue.splice(idx, 1); }
+          activeCount = Math.max(0, activeCount - 1);
+          broadcastStatus();
+          console.warn(`⏱ PROCESSING_TIMEOUT convId=${convId}`);
           reject(new Error('Timeout: la extensión no respondió en 3 minutos'));
         }
       }, PROCESSING_TIMEOUT);
 
-      pendingResolvers.set(capturedTaskId, { resolve, reject, timeoutId });
+      pendingResolvers.set(convId, { resolve, reject, timeoutId });
     });
 
     clearTimeout(httpTimeout);
-    console.log(`✅ Tarea completada (Task ID: ${capturedTaskId})`);
+    console.log(`✅ Tarea completada convId=${convId}`);
 
     if (!responded) {
       responded = true;
-      // Si no hay data.id (thread_id null), leer el archivo de conversación actual
-      let convId = data.id;
-      if (!convId) {
-        try {
-          const cur = JSON.parse(fs.readFileSync(CURRENT_CONV_FILE, 'utf8'));
-          convId = cur.conversationId || null;
-        } catch (e) {}
-      }
-      if (convId) {
-        const convFile = path.join(CONVERSATIONS_DIR, `${convId}.json`);
-        if (fs.existsSync(convFile)) {
-          const conversation = JSON.parse(fs.readFileSync(convFile, 'utf8'));
-          res.json({ success: true, result: conversation });
-          processNextInQueue();
-          return;
-        }
+      const convFile = path.join(CONVERSATIONS_DIR, `${convId}.json`);
+      if (fs.existsSync(convFile)) {
+        const conversation = JSON.parse(fs.readFileSync(convFile, 'utf8'));
+        return res.json({ success: true, result: conversation });
       }
       res.json({ success: true, message: 'Prompt procesado correctamente' });
     }
@@ -323,8 +243,6 @@ async function executePromptRequest(data, res) {
       res.status(500).json({ error: error.message });
     }
   }
-
-  processNextInQueue();
 }
 
 // ─── Cleanup de conversaciones antiguas ──────────────────────────────────────
@@ -352,8 +270,8 @@ app.get('/docs', (req, res) => {
     openapi: '3.0.3',
     info: {
       title: 'AI Runner Server',
-      version: '2.0.0',
-      description: 'Middleware entre Finearom y la extension de VS Code que ejecuta prompts en GitHub Copilot.\n\n**Uso recomendado:** rutas `/v1/*` compatibles con la libreria openai — cambia `baseURL` y listo.\n\n**Auth:** header `X-Api-Key` requerido en todas las rutas excepto `/v1/health`.'
+      version: '3.0.0',
+      description: 'Middleware entre Finearom y la extension de VS Code que ejecuta prompts en GitHub Copilot.\n\n**Uso recomendado:** rutas `/v1/*` compatibles con la libreria openai cambia baseURL y listo.\n\n**Auth:** header `X-Api-Key` requerido en todas las rutas excepto `/v1/health`.\n\n**Paralelo:** soporta N conversaciones simultaneas. La extension corre N workers que hacen long-poll a `/api/prompt/wait`.'
     },
     servers: [{ url: '', description: 'Este servidor' }],
     components: {
@@ -383,10 +301,9 @@ app.get('/docs', (req, res) => {
         Status: {
           type: 'object',
           properties: {
-            isProcessing:     { type: 'boolean' },
-            taskId:           { type: 'integer', nullable: true },
-            available:        { type: 'boolean' },
-            queueLength:      { type: 'integer', description: 'Requests esperando en cola' },
+            active:           { type: 'integer', description: 'Conversaciones en proceso actualmente' },
+            queued:           { type: 'integer', description: 'Prompts esperando en cola' },
+            workers:          { type: 'integer', description: 'Workers de la extensión en long-poll' },
             wsClients:        { type: 'integer', description: 'Extensiones VS Code conectadas vía WebSocket' },
             pendingResolvers: { type: 'integer', description: 'Callers colgados esperando respuesta' }
           }
@@ -400,70 +317,67 @@ app.get('/docs', (req, res) => {
       { name: 'Sistema',        description: 'Estado del servidor' }
     ],
     paths: {
+      '/api/prompt/wait': {
+        get: {
+          tags: ['Interno'],
+          summary: 'Long-poll: esperar un prompt (worker exclusivo)',
+          description: 'La extension corre N workers en paralelo, cada uno llama este endpoint en loop. El servidor le da un prompt EXCLUSIVO (otro worker no lo recibira). Si no hay prompts, espera hasta 30s.\n\n**Nuevo en v3:** cada worker recibe un prompt diferente, habilitando procesamiento paralelo.',
+          responses: {
+            200: {
+              description: 'Prompt para procesar (o vacio si timeout)',
+              content: { 'application/json': { schema: {
+                type: 'object',
+                properties: {
+                  prompt:      { type: 'string' },
+                  newChat:     { type: 'boolean' },
+                  id:          { type: 'string', nullable: true, description: 'conversationId' },
+                  extractJson: { type: 'boolean' },
+                  modelFamily: { type: 'string', nullable: true },
+                  justification: { type: 'string', nullable: true },
+                  modelOptions: { type: 'object', nullable: true },
+                  systemPrompt: { type: 'string', nullable: true },
+                  maxInputTokens: { type: 'integer', nullable: true }
+                }
+              }}}
+            }
+          }
+        }
+      },
       '/api/prompt/clear': {
         post: {
           tags: ['Interno'],
-          summary: 'Limpiar prompt / cancelar request activo',
-          description: '**Sin body:** la extensión lo llama al tomar el prompt — solo limpia el archivo, no cancela el caller.\n\n**Con `cancel: true`:** cancela el request activo inmediatamente. El caller recibe error 500 al instante y el sistema queda libre.',
+          summary: 'Limpiar / cancelar una conversacion',
+          description: 'Sin body: no hace nada (compatibilidad).\n\nCon `cancel: true` + `conversationId`: cancela esa conversacion especifica. Sin conversationId cancela todas.',
           requestBody: {
             content: { 'application/json': { schema: { type: 'object', properties: {
-              cancel: { type: 'boolean', default: false, description: '`true` para matar un request colgado' }
+              cancel:         { type: 'boolean', default: false },
+              conversationId: { type: 'string', description: 'ID de la conversacion a cancelar (opcional)' }
             }}}}
           },
           responses: {
             200: { description: 'OK', content: { 'application/json': { schema: { type: 'object', properties: {
               success:   { type: 'boolean' },
-              cancelled: { type: 'boolean', description: 'true si se canceló un request activo' }
+              cancelled: { type: 'boolean' }
             }}}}}
           }
-        }
-      },
-      '/api/prompt': {
-        get: {
-          tags: ['Interno'],
-          summary: 'Estado actual del prompt',
-          description: 'La extensión llama esto cada 2s. Responde desde memoria sin tocar disco.',
-          responses: {
-            200: { description: 'Estado del prompt en memoria', content: { 'application/json': { schema: {
-              type: 'object',
-              properties: {
-                prompt:      { type: 'string' },
-                newChat:     { type: 'boolean' },
-                id:          { type: 'string', nullable: true },
-                extractJson: { type: 'boolean' },
-                isImage:     { type: 'boolean' },
-                focused:     { type: 'boolean' },
-                isProcessing:{ type: 'boolean' },
-                taskId:      { type: 'integer', nullable: true }
-              }
-            }}}}
-          }
-        }
-      },
-      '/api/prompt/wait': {
-        get: {
-          tags: ['Interno'],
-          summary: 'Long-polling — espera hasta que haya un prompt nuevo',
-          description: 'Si hay prompt activo responde de inmediato. Si no, mantiene la conexión abierta hasta 30s.',
-          responses: { 200: { description: 'Prompt disponible o respuesta vacía por timeout' } }
         }
       },
       '/api/save': {
         post: {
           tags: ['Interno'],
-          summary: 'Guardar respuesta (uso interno de la extensión)',
-          description: 'La extensión llama esto cuando Copilot terminó. **Libera al caller de `/api/prompt/set` al instante.**',
+          summary: 'Guardar respuesta de la extension',
+          description: 'La extension llama esto cuando termina de procesar un prompt. Resuelve el caller por conversationId.',
           requestBody: {
             required: true,
             content: { 'application/json': { schema: { type: 'object', required: ['text'], properties: {
-              text:        { type: 'string',  description: 'Respuesta del modelo (texto o base64 si isImage=true)' },
-              prompt:      { type: 'string',  description: 'Prompt original (para guardarlo en el historial)' },
-              promptId:    { type: 'string',  nullable: true, description: 'ID de la conversación' },
-              extractJson: { type: 'boolean', default: false }
+              text:           { type: 'string' },
+              prompt:         { type: 'string' },
+              promptId:       { type: 'string', description: 'conversationId al que pertenece esta respuesta' },
+              extractJson:    { type: 'boolean' }
             }}}}
           },
           responses: {
-            200: { description: 'Guardado y caller notificado', content: { 'application/json': { schema: { type: 'object', properties: {
+            200: { description: 'OK', content: { 'application/json': { schema: { type: 'object', properties: {
               success:       { type: 'boolean' },
               conversationId:{ type: 'string' },
               messageCount:  { type: 'integer' }
@@ -474,217 +388,288 @@ app.get('/docs', (req, res) => {
       '/api/status': {
         get: {
           tags: ['Sistema'],
-          summary: 'Estado del servidor en tiempo real',
-          responses: { 200: { description: 'Estado actual', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Status' } } } } }
+          summary: 'Estado del servidor',
+          responses: {
+            200: { description: 'OK', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Status' } } } }
+          }
         }
       },
-      '/api/conversations/current': {
-        get: {
+      '/api/prompt/set': {
+        post: {
           tags: ['Interno'],
-          summary: 'Conversacion activa actual (uso interno)',
-          description: 'Retorna la conversacion que se esta procesando en este momento. Sin equivalente en /v1/*.',
-          responses: { 200: { description: 'Conversacion actual o null' } }
+          summary: 'Enviar prompt al servidor (interno)',
+          description: 'Alternativa interna. Preferir `/v1/chat/completions` para clientes OpenAI.',
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['prompt'], properties: {
+              prompt:       { type: 'string' },
+              newChat:      { type: 'boolean', default: true },
+              id:           { type: 'string', nullable: true, description: 'conversationId' },
+              extractJson:  { type: 'boolean', default: false },
+              modelFamily:  { type: 'string' },
+              justification:{ type: 'string' },
+              modelOptions: { type: 'object' },
+              systemPrompt: { type: 'string' },
+              maxInputTokens: { type: 'integer' }
+            }}}}
+          },
+          responses: {
+            200: { description: 'Respuesta procesada', content: { 'application/json': { schema: {
+              type: 'object',
+              properties: {
+                success: { type: 'boolean' },
+                result:  { '$ref': '#/components/schemas/Conversation' }
+              }
+            }}}}
+          }
         }
-      },
-
-      '/v1/health': {
-        get: { tags: ['OpenAI-compatible'], summary: 'Health check', security: [],
-          responses: { 200: { description: 'Estado del servidor', content: { 'application/json': { schema: { '$ref': '#/components/schemas/Status' } } } } } }
-      },
-      '/v1/models': {
-        get: { tags: ['OpenAI-compatible'], summary: 'Listar modelos disponibles (formato OpenAI)',
-          responses: { 200: { description: 'Lista de modelos' } } }
       },
       '/v1/chat/completions': {
         post: {
           tags: ['OpenAI-compatible'],
-          summary: 'Chat completions (formato OpenAI)',
-          description: 'Endpoint principal. Compatible con la libreria openai apuntando baseURL a este servidor. stream:true NO soportado.',
+          summary: 'Chat Completions (OpenAI-compatible)',
+          description: 'Endpoint principal. Compatible con la libreria openai: cambia `baseURL` y `apiKey` apuntando a este servidor.\n\n**Extensiones propias:**\n- `thread_id` — continuar conversacion existente (equivale a `conversationId`)\n- `justification` — instruccion extra para el modelo\n- `extract_json` — extrae JSON de la respuesta\n- `save_last_message_only` — no guarda el historial, solo el ultimo mensaje\n- `max_input_tokens` — limita tokens de entrada',
           requestBody: {
             required: true,
-            content: { 'application/json': { schema: { type: 'object', required: ['model', 'messages'], properties: {
-              model:                 { type: 'string', example: 'gpt-4.1', enum: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini', 'claude-sonnet-4-5'] },
-              messages:              { type: 'array', description: 'Mensajes en formato OpenAI', items: { type: 'object', properties: { role: { type: 'string', enum: ['system', 'user', 'assistant'] }, content: { type: 'string' } } } },
-              stream:                { type: 'boolean', default: false },
-              temperature:           { type: 'number' },
-              top_p:                 { type: 'number' },
-              max_tokens:            { type: 'integer' },
-              thread_id:             { type: 'string', nullable: true, description: 'Extension propia: ID del thread para continuar conversacion', example: 'ia_2064_cliente_2026-03' },
-              justification:         { type: 'string', nullable: true, description: 'Extension propia: texto del dialogo de consentimiento de VS Code' },
-              extract_json:          { type: 'boolean', default: false, description: 'Extension propia: extrae el primer JSON de la respuesta' },
-              save_last_message_only:{ type: 'boolean', default: false, description: 'Extension propia: solo guarda el ultimo mensaje en disco' },
-              max_input_tokens:      { type: 'integer', nullable: true, description: 'Extension propia: trunca historial si supera este limite' }
+            content: { 'application/json': { schema: { type: 'object', required: ['messages'], properties: {
+              model:                  { type: 'string', example: 'gpt-4.1' },
+              messages:               { type: 'array', items: { type: 'object', properties: {
+                role:    { type: 'string', enum: ['system', 'user', 'assistant'] },
+                content: { type: 'string' }
+              }}},
+              temperature:            { type: 'number' },
+              top_p:                  { type: 'number' },
+              max_tokens:             { type: 'integer' },
+              stream:                 { type: 'boolean', description: 'No soportado, debe ser false' },
+              thread_id:              { type: 'string', nullable: true, description: 'conversationId para continuar hilo' },
+              justification:          { type: 'string' },
+              extract_json:           { type: 'boolean', default: false },
+              save_last_message_only: { type: 'boolean', default: false },
+              max_input_tokens:       { type: 'integer' }
             }}}}
           },
           responses: {
-            200: { description: 'Respuesta en formato OpenAI', content: { 'application/json': { schema: { type: 'object', properties: {
-              id:        { type: 'string', example: 'chatcmpl-1710000000000' },
-              object:    { type: 'string', example: 'chat.completion' },
-              model:     { type: 'string' },
-              thread_id: { type: 'string', nullable: true, description: 'ID de la conversacion (extension propia)' },
-              choices:   { type: 'array', items: { type: 'object', properties: { message: { type: 'object', properties: { role: { type: 'string' }, content: { type: 'string' } } }, finish_reason: { type: 'string' } } } },
-              usage:     { type: 'object', properties: { prompt_tokens: { type: 'integer' }, completion_tokens: { type: 'integer' }, total_tokens: { type: 'integer' } } }
-            }}}}},
-            504: { description: 'Timeout — extension no respondio en 2 minutos' },
-            401: { description: 'API key invalida' }
+            200: { description: 'Respuesta en formato OpenAI', content: { 'application/json': { schema: {
+              type: 'object',
+              properties: {
+                id:        { type: 'string' },
+                object:    { type: 'string', example: 'chat.completion' },
+                created:   { type: 'integer' },
+                model:     { type: 'string' },
+                thread_id: { type: 'string', nullable: true, description: 'conversationId — usar en proximas llamadas para continuar el hilo' },
+                choices:   { type: 'array', items: { type: 'object', properties: {
+                  index:         { type: 'integer' },
+                  message:       { type: 'object', properties: { role: { type: 'string' }, content: { type: 'string' } } },
+                  finish_reason: { type: 'string' }
+                }}}
+              }
+            }}}}
+          }
+        }
+      },
+      '/v1/health': {
+        get: {
+          tags: ['Sistema'],
+          summary: 'Health check (sin auth)',
+          security: [],
+          responses: {
+            200: { description: 'OK', content: { 'application/json': { schema: {
+              type: 'object',
+              properties: {
+                status:  { type: 'string', example: 'ok' },
+                active:  { type: 'integer' },
+                queued:  { type: 'integer' },
+                workers: { type: 'integer' },
+                uptime:  { type: 'number' }
+              }
+            }}}}
+          }
+        }
+      },
+      '/v1/models': {
+        get: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Lista de modelos disponibles',
+          responses: {
+            200: { description: 'Lista de modelos', content: { 'application/json': { schema: { type: 'object', properties: {
+              object: { type: 'string', example: 'list' },
+              data:   { type: 'array', items: { type: 'object', properties: {
+                id:         { type: 'string' },
+                object:     { type: 'string' },
+                created:    { type: 'integer' },
+                owned_by:   { type: 'string' }
+              }}}
+            }}}}}
           }
         }
       },
       '/v1/threads': {
-        get:  { tags: ['OpenAI-compatible'], summary: 'Listar threads', responses: { 200: { description: 'Lista en formato OpenAI Assistants API' } } },
-        post: { tags: ['OpenAI-compatible'], summary: 'Crear thread vacio',
-          requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { id: { type: 'string' } } } } } },
-          responses: { 201: { description: 'Thread creado' } } }
+        get: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Lista de threads/conversaciones',
+          responses: {
+            200: { description: 'Lista de threads' }
+          }
+        },
+        post: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Crear thread vacío',
+          responses: {
+            201: { description: 'Thread creado' }
+          }
+        }
       },
       '/v1/threads/{id}': {
-        get:    { tags: ['OpenAI-compatible'], summary: 'Obtener thread', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], responses: { 200: { description: 'Thread' }, 404: { description: 'No encontrado' } } },
-        delete: { tags: ['OpenAI-compatible'], summary: 'Eliminar thread', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-          responses: { 200: { description: 'Eliminado', content: { 'application/json': { schema: { type: 'object', properties: { id: { type: 'string' }, object: { type: 'string' }, deleted: { type: 'boolean' } } } } } }, 404: { description: 'No encontrado' } } }
+        get: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Obtener thread',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { 200: { description: 'Thread' }, 404: { description: 'No encontrado' } }
+        },
+        delete: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Eliminar thread',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { 200: { description: 'Eliminado' }, 404: { description: 'No encontrado' } }
+        }
       },
       '/v1/threads/{id}/messages': {
-        get: { tags: ['OpenAI-compatible'], summary: 'Mensajes de un thread',
+        get: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Mensajes de un thread',
           parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-          responses: { 200: { description: 'Lista de mensajes en formato OpenAI' }, 404: { description: 'No encontrado' } } }
+          responses: { 200: { description: 'Lista de mensajes' }, 404: { description: 'No encontrado' } }
+        }
+      },
+      '/api/conversations': {
+        get: {
+          tags: ['Sistema'],
+          summary: 'Lista de conversaciones',
+          responses: { 200: { description: 'Lista de conversaciones' } }
+        }
+      },
+      '/api/conversations/current': {
+        get: {
+          tags: ['Sistema'],
+          summary: 'Conversacion actual',
+          responses: { 200: { description: 'Conversacion actual' } }
+        }
+      },
+      '/api/conversations/{id}': {
+        get: {
+          tags: ['Sistema'],
+          summary: 'Obtener conversacion por ID',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { 200: { description: 'Conversacion' }, 404: { description: 'No encontrada' } }
+        },
+        delete: {
+          tags: ['Sistema'],
+          summary: 'Eliminar conversacion',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { 200: { description: 'Eliminada' }, 404: { description: 'No encontrada' } }
+        }
       }
     }
   };
 
-  const html = `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>AI Runner — API Docs</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
-  <style>
-    body { margin: 0; background: #fafafa; }
-    .swagger-ui .topbar { background: #1a1a2e; }
-    .swagger-ui .topbar .download-url-wrapper { display: none; }
-  </style>
-</head>
-<body>
-  <div id="ui"></div>
-  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-  <script>
-    SwaggerUIBundle({
-      spec: ${JSON.stringify(spec)},
-      dom_id: '#ui',
-      deepLinking: true,
-      tryItOutEnabled: true,
-      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
-      layout: 'BaseLayout',
-      requestInterceptor: req => { req.headers['X-Api-Key'] = '${API_KEY}'; return req; }
-    });
-  </script>
-</body>
-</html>`;
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  const html = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>AI Runner API</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head><body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+SwaggerUIBundle({
+  spec: ${JSON.stringify(spec)},
+  dom_id: '#swagger-ui',
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+  layout: 'BaseLayout',
+  deepLinking: true,
+  tryItOutEnabled: true,
+  defaultModelsExpandDepth: -1,
+  requestInterceptor: (req) => { if (!req.headers['X-Api-Key']) req.headers['X-Api-Key'] = 'finearom-ai-2025'; return req; }
+});
+</script></body></html>`;
+
+  res.setHeader('Content-Type', 'text/html');
   res.send(html);
 });
 
-// ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+// ─── RUTAS INTERNAS (/api/*) ──────────────────────────────────────────────────
 
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>AI Runner Server</title>
-    <style>body{font-family:Arial,sans-serif;max-width:500px;margin:50px auto;padding:20px;background:#f5f5f5}
-    .box{background:white;padding:24px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
-    .status{display:inline-block;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold}
-    .idle{background:#e8f5e9;color:#2e7d32}.busy{background:#fff3e0;color:#e65100}
-    code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:13px}</style></head>
-    <body><div class="box">
-      <h2>🤖 AI Runner Server</h2>
-      <p>Estado: <span class="status ${isProcessing ? 'busy' : 'idle'}">${isProcessing ? 'Procesando' : 'Disponible'}</span></p>
-      <p>Cola: <strong>${requestQueue.length}</strong> request(s) pendientes</p>
-      <p>Puerto: <code>${PORT}</code></p>
-      <p>WS clientes: <strong>${wsClients.size}</strong> conectado(s)</p>
-      <p>Resolvers pendientes: <strong>${pendingResolvers.size}</strong></p>
-    </div></body></html>
-  `);
-});
-
-// La extensión llama esto cada 2s — responde desde memoria, sin tocar disco
-app.get('/api/prompt', (req, res) => {
-  checkAndResetTimeout();
-  res.json({
-    prompt: promptState.prompt || '',
-    newChat: promptState.newChat !== false,
-    saveLastMessageOnly: promptState.saveLastMessageOnly || false,
-    id: promptState.id || null,
-    extractJson: promptState.extractJson || false,
-    isImage: promptState.isImage || false,
-    focused: promptState.focused || false,
-    isProcessing,
-    taskId: currentTaskId
-  });
-});
-
+// Long-poll: la extensión espera aquí hasta que haya un prompt para ella (exclusivo)
 app.get('/api/prompt/wait', (req, res) => {
-  checkAndResetTimeout();
-  if (promptState.prompt && promptState.prompt.trim()) {
-    return res.json({
-      prompt: promptState.prompt,
-      newChat: promptState.newChat !== false,
-      saveLastMessageOnly: promptState.saveLastMessageOnly || false,
-      id: promptState.id || null,
-      extractJson: promptState.extractJson || false,
-      isProcessing,
-      taskId: currentTaskId
-    });
+  // Si hay un prompt en cola, darlo inmediatamente
+  if (promptQueue.length > 0) {
+    const prompt = promptQueue.shift();
+    console.log(`📡 Worker recibe prompt inmediato convId=${prompt.id}. Queue: ${promptQueue.length}`);
+    broadcastStatus();
+    return res.json(prompt);
   }
 
+  // Sin prompts: esperar hasta WORKER_WAIT_TIMEOUT
   const timer = setTimeout(() => {
-    const idx = waitingClients.findIndex(c => c.res === res);
-    if (idx > -1) { waitingClients.splice(idx, 1); }
-    res.json({ prompt: '', isProcessing: false, taskId: null });
-  }, 30000);
+    const idx = waitingWorkers.findIndex(w => w.res === res);
+    if (idx > -1) { waitingWorkers.splice(idx, 1); }
+    res.json({ prompt: '', id: null });
+  }, WORKER_WAIT_TIMEOUT);
 
   res.on('close', () => {
     clearTimeout(timer);
-    const idx = waitingClients.findIndex(c => c.res === res);
-    if (idx > -1) { waitingClients.splice(idx, 1); }
+    const idx = waitingWorkers.findIndex(w => w.res === res);
+    if (idx > -1) { waitingWorkers.splice(idx, 1); }
   });
 
-  waitingClients.push({ res, timer });
+  waitingWorkers.push({ res, timer });
+  console.log(`⏳ Worker en espera. Workers: ${waitingWorkers.length}, Queue: ${promptQueue.length}`);
 });
 
-// La extensión lo llama al inicio del flujo (sin cancel) — solo limpia el prompt, no cancela el resolver.
-// Para matar un request colgado manualmente: POST /api/prompt/clear con { cancel: true }
+// Limpiar / cancelar — compatible con versión anterior
 app.post('/api/prompt/clear', (req, res) => {
   try {
-    const cancel = req.body?.cancel === true;
-    writePromptState(EMPTY_PROMPT);
+    const { cancel, conversationId } = req.body || {};
 
-    if (cancel && isProcessing) {
-      const taskIdToKill = currentTaskId;
-      resetProcessingState();
-      console.log(`🛑 Request cancelado manualmente (Task ID: ${taskIdToKill})`);
-
-      // Rechazar el resolver — el caller recibirá un error 500 inmediatamente
-      if (pendingResolvers.size > 0) {
-        for (const [taskId, pending] of pendingResolvers.entries()) {
+    if (cancel) {
+      const cancelOne = (convId) => {
+        const pending = pendingResolvers.get(convId);
+        if (pending) {
           clearTimeout(pending.timeoutId);
           pending.reject(new Error('Request cancelado manualmente vía /api/prompt/clear'));
-          pendingResolvers.delete(taskId);
+          pendingResolvers.delete(convId);
+          // Remover de la cola si aún no fue tomado
+          const idx = promptQueue.findIndex(p => p.id === convId);
+          if (idx > -1) { promptQueue.splice(idx, 1); }
+          activeCount = Math.max(0, activeCount - 1);
+          return true;
         }
-        console.log(`⚡ Caller notificado del cancelado al instante`);
-      }
+        return false;
+      };
 
-      processNextInQueue();
-    } else if (isProcessing) {
-      console.log(`🔓 Prompt tomado por la extensión (Task ID: ${currentTaskId}) — esperando /api/save`);
+      if (conversationId) {
+        const cancelled = cancelOne(conversationId);
+        broadcastStatus();
+        console.log(`🛑 Cancelado convId=${conversationId}: ${cancelled}`);
+        return res.json({ success: true, cancelled });
+      } else {
+        // Cancelar todos
+        let count = 0;
+        for (const [convId] of pendingResolvers.entries()) {
+          if (cancelOne(convId)) { count++; }
+        }
+        broadcastStatus();
+        console.log(`🛑 Cancelados ${count} requests`);
+        return res.json({ success: true, cancelled: count > 0 });
+      }
     }
 
-    res.json({ success: true, cancelled: cancel });
+    res.json({ success: true, cancelled: false });
   } catch (error) {
     res.status(500).json({ error: 'Error al limpiar el prompt' });
   }
 });
 
+// Enviar prompt al servidor para que lo procese la extensión
 app.post('/api/prompt/set', async (req, res) => {
   try {
-    checkAndResetTimeout();
-
     const { prompt, newChat, saveLastMessageOnly, id, extractJson, isImage, focused,
             modelFamily, justification, modelOptions, systemPrompt, maxInputTokens } = req.body;
     if (prompt === undefined) {
@@ -707,31 +692,22 @@ app.post('/api/prompt/set', async (req, res) => {
     };
 
     console.log(`[Server] /api/prompt/set: "${prompt.substring(0, 80)}..." id=${id}`);
-
-    if (!isProcessing) {
-      return await executePromptRequest(data, res);
-    }
-
-    requestQueue.push({ data, res });
-    console.log(`📋 Request encolado. Posición en cola: ${requestQueue.length}`);
-
+    return await executePromptRequest(data, res);
   } catch (error) {
     console.error('Error en /api/prompt/set:', error);
     res.status(500).json({ error: error.message || 'Error procesando el prompt' });
   }
 });
 
+// La extensión llama esto cuando termina de procesar un prompt
 app.post('/api/save', (req, res) => {
   try {
     const { text, prompt, extractJson } = req.body;
     if (!text) { return res.status(400).json({ error: 'El campo "text" es requerido' }); }
 
     let finalText = extractJson ? extractJsonFromText(text) : text;
-
-    // Leer newChat y saveLastMessageOnly desde el promptState actual
-    // (puede estar vacío si /api/prompt/clear ya corrió, por eso lo leemos del req.body también)
-    const isNewChat           = promptState.newChat !== false;
-    const saveLastMessageOnly = promptState.saveLastMessageOnly || false;
+    const saveLastMessageOnly = req.body.saveLastMessageOnly || false;
+    const isNewChat = req.body.newChat !== false;
 
     let conversationId;
     if (req.body.promptId) {
@@ -769,15 +745,20 @@ app.post('/api/save', (req, res) => {
       conversation = saveToConversation(conversationId, 'assistant', finalText, req.body.promptId);
     }
 
-    console.log(`💾 Respuesta guardada en conversación: ${conversationId}`);
+    console.log(`💾 Respuesta guardada convId=${conversationId}`);
 
-    // Liberar estado y notificar al caller al instante
-    resetProcessingState();
-    const resolved = resolveAllPending();
-    if (resolved) {
-      console.log(`⚡ Caller notificado al instante`);
+    // Liberar contador y resolver el caller
+    activeCount = Math.max(0, activeCount - 1);
+    broadcastStatus();
+
+    const pending = pendingResolvers.get(conversationId);
+    if (pending) {
+      clearTimeout(pending.timeoutId);
+      pending.resolve();
+      pendingResolvers.delete(conversationId);
+      console.log(`⚡ Caller notificado convId=${conversationId}`);
     } else {
-      console.log(`ℹ️ Caller ya había respondido por timeout`);
+      console.log(`ℹ️ Caller ya había respondido por timeout (convId=${conversationId})`);
     }
 
     res.json({ success: true, message: 'Respuesta guardada correctamente', conversationId, messageCount: conversation.messages.length });
@@ -789,11 +770,10 @@ app.post('/api/save', (req, res) => {
 
 app.get('/api/status', (req, res) => {
   res.json({
-    isProcessing,
-    taskId: currentTaskId,
-    available: !isProcessing,
-    queueLength: requestQueue.length,
-    wsClients: wsClients.size,
+    active:           activeCount,
+    queued:           promptQueue.length,
+    workers:          waitingWorkers.length,
+    wsClients:        wsClients.size,
     pendingResolvers: pendingResolvers.size
   });
 });
@@ -864,18 +844,10 @@ app.delete('/api/conversations/:id', (req, res) => {
   }
 });
 
-// (popup endpoints eliminados)
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// ─── RUTAS ESTÁNDAR OpenAI-compatible (/v1/*) ────────────────────────────────
+// ─── RUTAS OpenAI-compatible (/v1/*) ─────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
-//
-// Las rutas /api/* internas siguen funcionando (extensión VS Code las usa).
-// Estas son aliases con formato estándar para que cualquier cliente OpenAI
-// pueda apuntar a este servidor cambiando solo el baseURL.
 
-// ─── Auth middleware para /v1/* ───────────────────────────────────────────────
-// Acepta: X-Api-Key, Authorization: Bearer <key>
 app.use('/v1', (req, res, next) => {
   const key = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
   if (key !== API_KEY) {
@@ -884,20 +856,17 @@ app.use('/v1', (req, res, next) => {
   next();
 });
 
-// ─── GET /v1/health ──────────────────────────────────────────────────────────
 app.get('/v1/health', (req, res) => {
   res.json({
-    status: isProcessing ? 'busy' : 'ok',
-    isProcessing,
-    queueLength: requestQueue.length,
+    status: activeCount > 0 ? 'busy' : 'ok',
+    active: activeCount,
+    queued: promptQueue.length,
+    workers: waitingWorkers.length,
     wsClients: wsClients.size,
-    pendingResolvers: pendingResolvers.size,
     uptime: process.uptime()
   });
 });
 
-// ─── GET /v1/models ──────────────────────────────────────────────────────────
-// Devuelve los modelos soportados en formato OpenAI
 app.get('/v1/models', (req, res) => {
   const models = ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini', 'claude-sonnet-4-5'];
   res.json({
@@ -911,19 +880,8 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// ─── POST /v1/chat/completions ───────────────────────────────────────────────
-// Endpoint principal en formato OpenAI. Traduce al formato interno y espera.
-//
-// Request OpenAI:
-//   model, messages[], temperature, max_tokens, stream
-//   + extensiones propias: thread_id, justification, extract_json, save_last_message_only
-//
-// Response OpenAI:
-//   id, object, created, model, choices[{message, finish_reason}], usage
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    checkAndResetTimeout();
-
     const { model, messages, temperature, top_p, max_tokens, stream,
             thread_id, justification, extract_json, save_last_message_only, max_input_tokens } = req.body;
 
@@ -935,11 +893,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       return res.status(400).json({ error: { message: 'Streaming not supported. Use stream: false', type: 'invalid_request_error' } });
     }
 
-    // Extraer system prompt (primer mensaje con role: 'system')
     const systemMsg = messages.find(m => m.role === 'system');
     const systemPrompt = systemMsg?.content || null;
 
-    // Último mensaje de usuario
     const userMessages = messages.filter(m => m.role === 'user');
     const lastUser = userMessages[userMessages.length - 1];
     if (!lastUser) {
@@ -948,13 +904,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const prompt = typeof lastUser.content === 'string' ? lastUser.content : lastUser.content?.map(p => p.text || '').join('');
 
-    // Construir modelOptions a partir de parámetros OpenAI estándar
     const modelOptions = {};
     if (temperature !== undefined) { modelOptions.temperature = temperature; }
     if (top_p       !== undefined) { modelOptions.top_p       = top_p; }
     if (max_tokens  !== undefined) { modelOptions.max_tokens  = max_tokens; }
 
-    // Determinar si es newChat: sin thread_id = nueva conversación
     const conversationId = thread_id || null;
     const newChat = !conversationId;
 
@@ -974,13 +928,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
 
     console.log(`[v1] /chat/completions model=${data.modelFamily} thread=${conversationId || 'new'}`);
-
-    if (isProcessing) {
-      requestQueue.push({ data, res: wrapResForV1(res, data.modelFamily, Date.now()) });
-      console.log(`📋 [v1] Request encolado. Cola: ${requestQueue.length}`);
-      return;
-    }
-
     return await executePromptRequest(data, wrapResForV1(res, data.modelFamily, Date.now()));
 
   } catch (error) {
@@ -989,7 +936,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// Envuelve el res de Express para que executePromptRequest devuelva formato OpenAI
+// Envuelve res de Express para que executePromptRequest devuelva formato OpenAI
 function wrapResForV1(res, modelId, startTime) {
   return {
     status(code) {
@@ -997,11 +944,9 @@ function wrapResForV1(res, modelId, startTime) {
       return this;
     },
     json(body) {
-      // Si es error del sistema interno, convertirlo a formato OpenAI
       if (body.error && typeof body.error === 'string') {
         return res.json({ error: { message: body.error, type: 'server_error' } });
       }
-      // Si es éxito con result (conversación) → extraer último mensaje del asistente
       if (body.success) {
         const conv    = body.result;
         const content = conv?.messages?.slice().reverse().find(m => m.role === 'assistant')?.text
@@ -1018,13 +963,11 @@ function wrapResForV1(res, modelId, startTime) {
           usage:   { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
         });
       }
-      // Fallback
       return res.json(body);
     }
   };
 }
 
-// ─── GET /v1/threads ─────────────────────────────────────────────────────────
 app.get('/v1/threads', (req, res) => {
   try {
     const files = fs.readdirSync(CONVERSATIONS_DIR)
@@ -1047,8 +990,6 @@ app.get('/v1/threads', (req, res) => {
   }
 });
 
-// ─── POST /v1/threads ────────────────────────────────────────────────────────
-// Crear un thread vacío (conversación sin mensajes aún)
 app.post('/v1/threads', (req, res) => {
   try {
     const id = req.body.id || generateConversationId();
@@ -1069,7 +1010,6 @@ app.post('/v1/threads', (req, res) => {
   }
 });
 
-// ─── GET /v1/threads/:id ─────────────────────────────────────────────────────
 app.get('/v1/threads/:id', (req, res) => {
   try {
     const convFile = path.join(CONVERSATIONS_DIR, `${req.params.id}.json`);
@@ -1090,7 +1030,6 @@ app.get('/v1/threads/:id', (req, res) => {
   }
 });
 
-// ─── DELETE /v1/threads/:id ──────────────────────────────────────────────────
 app.delete('/v1/threads/:id', (req, res) => {
   try {
     const convFile = path.join(CONVERSATIONS_DIR, `${req.params.id}.json`);
@@ -1104,8 +1043,6 @@ app.delete('/v1/threads/:id', (req, res) => {
   }
 });
 
-// ─── GET /v1/threads/:id/messages ────────────────────────────────────────────
-// Devuelve los mensajes de un thread en formato OpenAI
 app.get('/v1/threads/:id/messages', (req, res) => {
   try {
     const convFile = path.join(CONVERSATIONS_DIR, `${req.params.id}.json`);
@@ -1141,16 +1078,24 @@ wss.on('connection', (ws, req) => {
 
   const pingInterval = setInterval(() => { if (ws.readyState === 1) { ws.ping(); } }, 30000);
 
-  ws.on('close', () => { wsClients.delete(ws); clearInterval(pingInterval); console.log(`🔌 WS: cliente desconectado. Total: ${wsClients.size}`); });
+  ws.on('close', () => { wsClients.delete(ws); clearInterval(pingInterval); console.log(`🔌 WS: desconectado. Total: ${wsClients.size}`); });
   ws.on('error', (err) => { wsClients.delete(ws); clearInterval(pingInterval); console.error(`🔌 WS error:`, err.message); });
 
-  ws.send(JSON.stringify({ type: 'connected', message: 'AI Runner WS listo' }));
+  // Enviar estado actual al conectarse
+  ws.send(JSON.stringify({
+    type: 'connected',
+    message: 'AI Runner WS listo',
+    active: activeCount,
+    queued: promptQueue.length,
+    workers: waitingWorkers.length
+  }));
 });
 
 server.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
   console.log(`🔌 WebSocket disponible en ws://localhost:${PORT}/ws`);
   console.log(`🔑 API Key activa`);
-  console.log(`⚡ Resolvers event-driven (sin polling)`);
+  console.log(`⚡ Paralelo: N workers via long-poll /api/prompt/wait`);
   console.log(`🧹 Cleanup automático de conversaciones >30 días`);
+  console.log(`📚 Docs: http://localhost:${PORT}/docs`);
 });
