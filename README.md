@@ -1,71 +1,71 @@
 # AI Runner Server
 
-Servidor middleware que conecta cualquier aplicacion (via API compatible con OpenAI) con GitHub Copilot corriendo en VS Code. Soporta N conversaciones paralelas simultaneas.
+Middleware server that connects any application (via OpenAI-compatible API) with GitHub Copilot running in VS Code. Supports N simultaneous parallel conversations.
 
 ```
-Tu App / Laravel / Postman
+Your App / Laravel / Postman
         |  POST /v1/chat/completions
         v
    AI Runner Server  ─────────────────────>  VS Code Extension
    (Node.js / Docker)    long-poll              (GitHub Copilot)
         ^                                             |
         └─────────────────────────────────────────────┘
-              POST /api/save (respuesta)
+              POST /api/save (response)
 ```
 
 ---
 
-## Requisitos
+## Requirements
 
-| Opcion | Requisitos |
-|--------|-----------|
-| **Docker** (recomendado) | Docker + Docker Compose |
+| Option | Requirements |
+|--------|-------------|
+| **Docker** (recommended) | Docker + Docker Compose |
 | **Manual** | Node.js 18+ |
 
-> La extension VS Code debe estar instalada y corriendo — es quien ejecuta los prompts en Copilot.
+> The VS Code extension must be installed and running — it is what executes prompts via Copilot.
 
 ---
 
-## Opcion A — Docker (recomendado)
+## Option A — Docker (recommended)
 
-### 1. Clonar el repositorio
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/lordmacu/aiextension-server.git
 cd aiextension-server
 ```
 
-### 2. Configurar variables de entorno (opcional)
+### 2. Configure environment variables (optional)
 
 ```bash
 cp .env.example .env
-# Editar .env si quieres cambiar el puerto o la API key
+# Edit .env if you want to change the port or API key
 ```
 
-| Variable | Default | Descripcion |
+| Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `54321` | Puerto del servidor |
-| `AI_API_KEY` | `YOUR_KEY` | API key para autenticar requests |
+| `PORT` | `54321` | Server port |
+| `AI_API_KEY` | `YOUR_KEY` | API key to authenticate requests |
 
-### 3. Levantar
+### 3. Start
 
 ```bash
 docker compose up -d
 ```
 
-El servidor queda disponible en `http://localhost:54321`.
+The server will be available at `http://localhost:54321`.
 
-### Comandos utiles Docker
+### Useful Docker commands
 
 ```bash
-docker compose up -d          # Levantar en background
-docker compose down           # Detener
-docker compose logs -f        # Ver logs en tiempo real
-docker compose restart        # Reiniciar
-docker compose pull && docker compose up -d  # Actualizar imagen
+docker compose up -d          # Start in background
+docker compose down           # Stop
+docker compose logs -f        # Tail logs in real time
+docker compose restart        # Restart
+docker compose pull && docker compose up -d  # Update image
 ```
 
-### Verificar que funciona
+### Verify it's working
 
 ```bash
 curl http://localhost:54321/v1/health
@@ -74,9 +74,9 @@ curl http://localhost:54321/v1/health
 
 ---
 
-## Opcion B — Manual (sin Docker)
+## Option B — Manual (without Docker)
 
-### 1. Clonar e instalar dependencias
+### 1. Clone and install dependencies
 
 ```bash
 git clone https://github.com/lordmacu/aiextension-server.git
@@ -84,20 +84,20 @@ cd aiextension-server
 npm install
 ```
 
-### 2. Iniciar
+### 2. Start
 
 ```bash
-# Desarrollo
+# Development
 node server.js
 
-# Produccion con PM2 (recomendado)
+# Production with PM2 (recommended)
 npm install -g pm2
 pm2 start server.js --name aiextension-server
 pm2 save
-pm2 startup   # copiar y ejecutar el comando que imprime
+pm2 startup   # copy and run the command it prints
 ```
 
-### 3. Verificar
+### 3. Verify
 
 ```bash
 curl http://localhost:54321/v1/health
@@ -105,9 +105,9 @@ curl http://localhost:54321/v1/health
 
 ---
 
-## Instalacion en servidor Linux con Apache (produccion)
+## Linux Server with Apache (production)
 
-### 1. Instalar Node.js y PM2
+### 1. Install Node.js and PM2
 
 ```bash
 # Ubuntu/Debian
@@ -116,45 +116,45 @@ sudo apt-get install -y nodejs
 sudo npm install -g pm2
 ```
 
-### 2. Clonar y configurar
+### 2. Clone and configure
 
 ```bash
-cd /home/bitnami   # o tu directorio home
+cd /home/bitnami   # or your home directory
 git clone https://github.com/lordmacu/aiextension-server.git aiextension
 cd aiextension
 npm install
 ```
 
-### 3. Levantar con PM2
+### 3. Start with PM2
 
 ```bash
 pm2 start server.js --name aiextension-server
 pm2 save
-pm2 startup   # ejecutar el comando que genera este
+pm2 startup   # run the command it generates
 ```
 
-### 4. Proxy reverso en Apache
+### 4. Apache reverse proxy
 
-Habilitar modulos (una sola vez):
+Enable modules (once):
 
 ```bash
 sudo a2enmod proxy proxy_http proxy_wstunnel rewrite
 sudo systemctl restart apache2
 ```
 
-Agregar en tu VirtualHost (`/etc/apache2/sites-available/tu-sitio.conf`):
+Add to your VirtualHost (`/etc/apache2/sites-available/your-site.conf`):
 
 ```apache
 <VirtualHost *:443>
-    ServerName tu-dominio.com
-    # ... tu config SSL existente ...
+    ServerName your-domain.com
+    # ... your existing SSL config ...
 
-    # Proxy al servidor AI en ruta /ai/
-    # IMPORTANTE: la barra final en ambos lados es obligatoria
+    # Proxy to AI server at /ai/ path
+    # IMPORTANT: trailing slash on both sides is required
     ProxyPass        /ai/ http://127.0.0.1:54321/
     ProxyPassReverse /ai/ http://127.0.0.1:54321/
 
-    # WebSocket (para actualizaciones en tiempo real en la extension)
+    # WebSocket (for real-time updates in the extension)
     RewriteEngine On
     RewriteCond %{HTTP:Upgrade} websocket [NC]
     RewriteCond %{HTTP:Connection} upgrade [NC]
@@ -166,26 +166,26 @@ Agregar en tu VirtualHost (`/etc/apache2/sites-available/tu-sitio.conf`):
 sudo systemctl restart apache2
 ```
 
-El servidor queda disponible en `https://tu-dominio.com/ai/`.
+The server will be available at `https://your-domain.com/ai/`.
 
-### 5. Configurar la extension VS Code
+### 5. Configure the VS Code extension
 
-En VS Code -> Configuracion -> buscar `aiRunner`:
+In VS Code → Settings → search `aiRunner`:
 
-| Setting | Valor |
+| Setting | Value |
 |---------|-------|
-| `aiRunner.serverUrl` | `https://tu-dominio.com/ai` |
-| `aiRunner.apiKey` | `YOUR_KEY` (o tu clave) |
+| `aiRunner.serverUrl` | `https://your-domain.com/ai` |
+| `aiRunner.apiKey` | `YOUR_KEY` (or your key) |
 
 ---
 
-## Extension VS Code
+## VS Code Extension
 
-La extension ejecuta los prompts en GitHub Copilot. Sin ella el servidor recibe requests pero no puede procesarlos.
+The extension executes prompts via GitHub Copilot. Without it the server receives requests but cannot process them.
 
-**Repositorio: [vscode-ai-extension →](https://github.com/lordmacu/vscode-ai-extension)**
+**Repository: [vscode-ai-extension →](https://github.com/lordmacu/vscode-ai-extension)**
 
-### Instalar la extension
+### Install the extension
 
 ```bash
 git clone https://github.com/lordmacu/vscode-ai-extension.git
@@ -193,24 +193,24 @@ cd vscode-ai-extension
 bash install.sh
 ```
 
-Recargar VS Code (`Cmd+Shift+P` -> Reload Window) y hacer clic en **Iniciar** en el panel AI Runner.
+Reload VS Code (`Cmd+Shift+P` → Reload Window) and click **Start** in the AI Runner panel.
 
-### Verificar conexion
+### Verify connection
 
-Con la extension activa, el servidor debe mostrar workers conectados:
+With the extension active, the server should show connected workers:
 
 ```bash
 curl -H "X-Api-Key: YOUR_KEY" http://localhost:54321/api/status
 # -> {"active":0,"queued":0,"workers":3,"wsClients":1,"pendingResolvers":0}
 #                                              ^
-#                                              3 workers listos
+#                                              3 workers ready
 ```
 
 ---
 
-## Uso de la API
+## API Usage
 
-### Endpoint principal — compatible con OpenAI
+### Main endpoint — OpenAI-compatible
 
 ```
 POST /v1/chat/completions
@@ -222,32 +222,32 @@ Content-Type: application/json
 {
   "model": "gpt-4.1",
   "messages": [
-    { "role": "system", "content": "Eres un asistente experto." },
-    { "role": "user",   "content": "Cuanto es 2 + 2?" }
+    { "role": "system", "content": "You are an expert assistant." },
+    { "role": "user",   "content": "What is 2 + 2?" }
   ],
   "stream": false,
-  "thread_id": "mi-conversacion-123"
+  "thread_id": "my-conversation-123"
 }
 ```
 
-### Comportamiento de la respuesta
+### Response behavior
 
-| Escenario | HTTP | Body |
-|-----------|------|------|
-| Extension activa, prompt procesado en < 30s | `200` | `{ choices[0].message.content }` |
-| Sin extension disponible en 30s | `202` | `{ accepted, conversationId, polling_url }` |
-| Error de procesamiento | `500` | `{ error: "..." }` |
+| Scenario | HTTP | Body |
+|----------|------|------|
+| Extension active, prompt processed in < 30s | `200` | `{ choices[0].message.content }` |
+| No extension available within 30s | `202` | `{ accepted, conversationId, polling_url }` |
+| Processing error | `500` | `{ error: "..." }` |
 
-Cuando recibes `202`, el prompt sigue en cola (hasta 5 minutos). Pollea `GET /api/conversations/:conversationId` para obtener el resultado cuando la extension lo procese.
+When you receive `202`, the prompt remains queued (up to 5 minutes). Poll `GET /api/conversations/:conversationId` to get the result once the extension processes it.
 
-Respuesta exitosa:
+Successful response:
 
 ```json
 {
   "id": "chatcmpl-1234567890",
   "object": "chat.completion",
   "model": "gpt-4.1",
-  "thread_id": "mi-conversacion-123",
+  "thread_id": "my-conversation-123",
   "choices": [{
     "index": 0,
     "message": { "role": "assistant", "content": "2 + 2 = 4" },
@@ -257,83 +257,83 @@ Respuesta exitosa:
 }
 ```
 
-### Parametros adicionales (extensiones propias)
+### Additional parameters (custom extensions)
 
-| Parametro | Tipo | Descripcion |
+| Parameter | Type | Description |
 |-----------|------|-------------|
-| `thread_id` | string | ID de conversacion para continuar un hilo. Omitir para nueva conversacion |
-| `justification` | string | Instruccion extra para el modelo |
-| `extract_json` | bool | Extraer JSON de la respuesta automaticamente |
-| `save_last_message_only` | bool | No guardar historial, solo el ultimo mensaje |
-| `max_input_tokens` | int | Limitar tokens de entrada |
+| `thread_id` | string | Conversation ID to continue a thread. Omit for a new conversation |
+| `justification` | string | Extra instruction for the model |
+| `extract_json` | bool | Automatically extract JSON from the response |
+| `save_last_message_only` | bool | Do not save history, only the last message |
+| `max_input_tokens` | int | Limit input tokens |
 
-### Modelos disponibles
+### Available models
 
 ```bash
 GET /v1/models
 X-Api-Key: YOUR_KEY
 ```
 
-Modelos soportados via Copilot:
+Models supported via Copilot:
 
-| Modelo | Notas |
-|--------|-------|
-| `gpt-4.1` | Default, incluido en Copilot |
-| `gpt-4.1-mini` | Mas rapido, menor costo |
+| Model | Notes |
+|-------|-------|
+| `gpt-4.1` | Default, included in Copilot |
+| `gpt-4.1-mini` | Faster, lower cost |
 | `gpt-4o`, `gpt-4o-mini` | OpenAI |
-| `o1`, `o3-mini` | Razonamiento |
+| `o1`, `o3-mini` | Reasoning |
 | `claude-sonnet-4-5` | Anthropic via Copilot |
 
-### Uso con libreria openai (Python)
+### Usage with openai library (Python)
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://tu-dominio.com/ai/v1",
+    base_url="https://your-domain.com/ai/v1",
     api_key="YOUR_KEY"
 )
 
 response = client.chat.completions.create(
     model="gpt-4.1",
-    messages=[{"role": "user", "content": "Hola"}],
+    messages=[{"role": "user", "content": "Hello"}],
     extra_body={"thread_id": "conv-001"}
 )
 print(response.choices[0].message.content)
 ```
 
-### Uso con libreria openai (Node.js / TypeScript)
+### Usage with openai library (Node.js / TypeScript)
 
 ```typescript
 import OpenAI from 'openai';
 
 const client = new OpenAI({
-  baseURL: 'https://tu-dominio.com/ai/v1',
+  baseURL: 'https://your-domain.com/ai/v1',
   apiKey: 'YOUR_KEY'
 });
 
 const response = await client.chat.completions.create({
   model: 'gpt-4.1',
-  messages: [{ role: 'user', content: 'Hola' }],
-  // @ts-ignore — parametro propio del servidor
+  messages: [{ role: 'user', content: 'Hello' }],
+  // @ts-ignore — custom server parameter
   thread_id: 'conv-001'
 });
 console.log(response.choices[0].message.content);
 ```
 
-### Uso con Laravel (PHP)
+### Usage with Laravel (PHP)
 
 ```php
 use Illuminate\Support\Facades\Http;
 
 $response = Http::withHeaders([
     'X-Api-Key' => 'YOUR_KEY',
-])->post('https://tu-dominio.com/ai/v1/chat/completions', [
+])->post('https://your-domain.com/ai/v1/chat/completions', [
     'model'     => 'gpt-4.1',
     'messages'  => [
-        ['role' => 'user', 'content' => 'Analiza estos datos: ...']
+        ['role' => 'user', 'content' => 'Analyze this data: ...']
     ],
-    'thread_id' => 'analisis-cliente-42',
+    'thread_id' => 'client-analysis-42',
     'stream'    => false,
 ]);
 
@@ -342,38 +342,38 @@ $content = $response->json('choices.0.message.content');
 
 ---
 
-## Endpoints de administracion
+## Admin Endpoints
 
 ```bash
-# Estado del servidor (workers, cola, conexiones)
-GET  /api/status                          X-Api-Key requerido
+# Server status (workers, queue, connections)
+GET  /api/status                          X-Api-Key required
 
-# Health check basico (sin auth)
+# Basic health check (no auth)
 GET  /v1/health
 
-# Documentacion interactiva Swagger
+# Interactive Swagger documentation
 GET  /docs
 
-# Listar todas las conversaciones
-GET  /v1/threads                          X-Api-Key requerido
+# List all conversations
+GET  /v1/threads                          X-Api-Key required
 
-# Ver mensajes de una conversacion
-GET  /v1/threads/{id}/messages            X-Api-Key requerido
+# View messages in a conversation
+GET  /v1/threads/{id}/messages            X-Api-Key required
 
-# Eliminar conversacion
-DELETE /v1/threads/{id}                   X-Api-Key requerido
+# Delete a conversation
+DELETE /v1/threads/{id}                   X-Api-Key required
 
-# Cancelar prompt en curso (uno o todos)
-POST /api/prompt/clear                    X-Api-Key requerido
-     {"cancel": true}                     # cancela todos
-     {"cancel": true, "conversationId": "x"}  # cancela uno
+# Cancel an in-progress prompt (one or all)
+POST /api/prompt/clear                    X-Api-Key required
+     {"cancel": true}                     # cancels all
+     {"cancel": true, "conversationId": "x"}  # cancels one
 ```
 
 ---
 
-## Paralelismo
+## Parallelism
 
-El servidor soporta cola infinita. La extension procesa **3 conversaciones en paralelo** por defecto.
+The server supports an infinite queue. The extension processes **3 conversations in parallel** by default.
 
 ```mermaid
 sequenceDiagram
@@ -399,47 +399,47 @@ sequenceDiagram
     W0->>S: GET /api/prompt/wait
 ```
 
-Para aumentar el paralelismo cambiar `WORKER_COUNT = 3` en `src/poller.ts` de la extension (requiere reconstruir e instalar la extension).
+To increase parallelism change `WORKER_COUNT = 3` in `src/poller.ts` of the extension (requires rebuilding and reinstalling the extension).
 
 ---
 
-## Estructura de archivos
+## File Structure
 
 ```
 aiextension-server/
-├── server.js            <- Servidor principal
+├── server.js            <- Main server
 ├── package.json
-├── .env.example         <- Variables de entorno de ejemplo
+├── .env.example         <- Example environment variables
 ├── Dockerfile
 ├── docker-compose.yml
-├── deploy.sh            <- Deploy automatico al VPS
-├── conversations/       <- Historial JSON (se crea automaticamente)
-└── images/              <- Imagenes base64 guardadas (se crea automaticamente)
+├── deploy.sh            <- Automated VPS deploy
+├── conversations/       <- JSON history (created automatically)
+└── images/              <- Saved base64 images (created automatically)
 ```
 
-Los directorios `conversations/` e `images/` se montan como volumenes en Docker, por lo que los datos persisten entre reinicios.
+The `conversations/` and `images/` directories are mounted as Docker volumes, so data persists across restarts.
 
 ---
 
 ## Timeouts
 
-| Timeout | Valor | Descripcion |
+| Timeout | Value | Description |
 |---------|-------|-------------|
-| `PROCESSING_TIMEOUT` | 5 min | Maximo para que la extension responda |
-| `HTTP_TIMEOUT` | 30 s | Maximo que el caller HTTP espera antes de recibir 202 |
-| `WORKER_WAIT_TIMEOUT` | 30 s | Long-poll del worker antes de reintentar |
-| Extension (Copilot) | 2 min | Timeout interno por prompt en la extension |
+| `PROCESSING_TIMEOUT` | 5 min | Maximum time for the extension to respond |
+| `HTTP_TIMEOUT` | 30 s | Maximum time the HTTP caller waits before receiving 202 |
+| `WORKER_WAIT_TIMEOUT` | 30 s | Worker long-poll before retrying |
+| Extension (Copilot) | 2 min | Internal timeout per prompt in the extension |
 
 ```mermaid
 flowchart LR
-    A["Caller envia request"] --> B["Server encola prompt"]
-    B --> C{"Worker toma el prompt\nen menos de 30s?"}
-    C -->|Si| D["Copilot ejecuta\nhasta 120s"]
-    C -->|No| E["202 Accepted\ncaller pollea /api/conversations/:id"]
-    D --> F{"Copilot responde\nen menos de 5 min?"}
+    A["Caller sends request"] --> B["Server queues prompt"]
+    B --> C{"Worker picks up<br/>within 30s?"}
+    C -->|Yes| D["Copilot executes<br/>up to 120s"]
+    C -->|No| E["202 Accepted<br/>caller polls /api/conversations/:id"]
+    D --> F{"Copilot responds<br/>within 5 min?"}
     E --> F
-    F -->|Si| G["200 al caller"]
-    F -->|No| H["PROCESSING_TIMEOUT\nconversacion descartada"]
+    F -->|Yes| G["200 to caller"]
+    F -->|No| H["PROCESSING_TIMEOUT<br/>conversation dropped"]
     style E fill:#f0ad4e,color:#000
     style H fill:#d9534f,color:#fff
     style G fill:#5cb85c,color:#fff
@@ -449,30 +449,30 @@ flowchart LR
 
 ## Troubleshooting
 
-**Error `401 Unauthorized`**
-Falta el header de autenticacion. Agregar: `X-Api-Key: YOUR_KEY`
+**`401 Unauthorized` error**
+Missing authentication header. Add: `X-Api-Key: YOUR_KEY`
 
-**El caller queda colgado sin respuesta**
-La extension VS Code no esta corriendo o no tiene workers activos. Verificar en VS Code que el panel AI Runner este en estado activo y muestre workers.
+**Caller hangs with no response**
+The VS Code extension is not running or has no active workers. Check in VS Code that the AI Runner panel is active and shows workers.
 
 **Apache `503 Service Unavailable`**
-Verificar que el `ProxyPass` tenga barra final en ambos lados:
+Verify that `ProxyPass` has a trailing slash on both sides:
 ```apache
-# CORRECTO
+# CORRECT
 ProxyPass /ai/ http://127.0.0.1:54321/
 
-# INCORRECTO — falta la barra final en la URL del proxy
+# INCORRECT — missing trailing slash on proxy URL
 ProxyPass /ai/ http://127.0.0.1:54321
 ```
 
-**`Workers: 0` en `/api/status`**
-La extension no esta conectada al servidor. Abrir VS Code -> panel AI Runner -> clic en Iniciar.
+**`Workers: 0` in `/api/status`**
+The extension is not connected to the server. Open VS Code → AI Runner panel → click Start.
 
-**Log: `Caller ya habia respondido por timeout`**
-El proxy (Apache/Nginx) cierra la conexion antes de que llegue la respuesta. Aumentar el timeout del proxy:
+**Log: `Caller had already responded due to timeout`**
+The proxy (Apache/Nginx) closes the connection before the response arrives. Increase the proxy timeout:
 ```apache
 ProxyTimeout 300
 ```
 
-**Docker: los datos no persisten**
-Verificar que los volumenes esten definidos en `docker-compose.yml` apuntando a los directorios `conversations/` e `images/`.
+**Docker: data does not persist**
+Verify that volumes are defined in `docker-compose.yml` pointing to the `conversations/` and `images/` directories.
