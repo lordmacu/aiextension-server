@@ -29,6 +29,12 @@ const pendingResolvers = new Map();
 // Contador de requests activos (en manos de un worker)
 let activeCount = 0;
 
+// ─── Tool calling ─────────────────────────────────────────────────────────────
+// Tool calls pendientes: callId → { name, input, convId, resolveResult, rejectResult }
+const pendingToolCalls = new Map();
+// Apps esperando tool calls por convId: convId → [{ resolve, timer }]
+const waitingToolCallers = new Map();
+
 // ─── WebSocket clients ───────────────────────────────────────────────────────
 const wsClients = new Set();
 
@@ -347,7 +353,8 @@ app.get('/docs', (req, res) => {
                   modelOptions: { type: 'object', nullable: true },
                   systemPrompt: { type: 'string', nullable: true },
                   maxInputTokens: { type: 'integer', nullable: true },
-                  images: { type: 'array', nullable: true, description: 'Data URLs base64 de imagenes adjuntas (data:image/png;base64,...)', items: { type: 'string' } }
+                  images: { type: 'array', nullable: true, description: 'Data URLs base64 de imagenes adjuntas (data:image/png;base64,...)', items: { type: 'string' } },
+                  tools: { type: 'array', nullable: true, description: 'Tool definitions (OpenAI format) para tool calling', items: { type: 'object' } }
                 }
               }}}
             }
@@ -578,6 +585,61 @@ app.get('/docs', (req, res) => {
           responses: { 200: { description: 'Lista de conversaciones' } }
         }
       },
+      '/api/tool/call': {
+        post: {
+          tags: ['Interno'],
+          summary: 'Reportar tool call (extensión → servidor)',
+          description: 'La extensión llama esto cuando Copilot solicita ejecutar un tool. El servidor lo retiene y lo despacha a la app via `/api/tool/wait/:convId`.',
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['callId', 'name', 'convId'], properties: {
+            callId: { type: 'string', description: 'ID único del tool call (proporcionado por Copilot)' },
+            name:   { type: 'string', description: 'Nombre del tool a ejecutar' },
+            input:  { type: 'object', description: 'Argumentos del tool call' },
+            convId: { type: 'string', description: 'conversationId al que pertenece' }
+          }}}}},
+          responses: { 200: { description: 'OK', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, callId: { type: 'string' } }}}}}}
+        }
+      },
+      '/api/tool/result/wait/{callId}': {
+        get: {
+          tags: ['Interno'],
+          summary: 'Esperar resultado del tool (extensión, long-poll 60s)',
+          parameters: [{ name: 'callId', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: { description: 'Resultado del tool', content: { 'application/json': { schema: { type: 'object', properties: { result: { description: 'Resultado retornado por la app' } }}}}},
+            504: { description: 'Timeout — la app no respondió en 60s' }
+          }
+        }
+      },
+      '/api/tool/wait/{convId}': {
+        get: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Esperar tool call pendiente para una conversación (app, long-poll 30s)',
+          description: 'La app llama esto en loop para recibir tool calls que Copilot quiere ejecutar. Retorna `{ callId: null }` en timeout.',
+          parameters: [{ name: 'convId', in: 'path', required: true, schema: { type: 'string' }, description: 'conversationId (thread_id) de la conversación' }],
+          responses: {
+            200: { description: 'Tool call o timeout', content: { 'application/json': { schema: { type: 'object', properties: {
+              callId: { type: 'string', nullable: true },
+              name:   { type: 'string', nullable: true },
+              input:  { type: 'object', nullable: true }
+            }}}}}
+          }
+        }
+      },
+      '/api/tool/result/{callId}': {
+        post: {
+          tags: ['OpenAI-compatible'],
+          summary: 'Enviar resultado de tool call (app → servidor → extensión)',
+          parameters: [{ name: 'callId', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: {
+            result: { description: 'Resultado de la ejecución del tool (string, objeto, número, etc.)' },
+            error:  { type: 'string', description: 'Si hubo error al ejecutar el tool, enviar este campo en vez de result' }
+          }}}}},
+          responses: {
+            200: { description: 'OK', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' } }}}}},
+            404: { description: 'Tool call no encontrado o ya resuelto' }
+          }
+        }
+      },
       '/api/conversations/current': {
         get: {
           tags: ['Sistema'],
@@ -695,6 +757,115 @@ app.post('/api/prompt/clear', (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Error al limpiar el prompt' });
   }
+});
+
+// ─── TOOL CALLING ─────────────────────────────────────────────────────────────
+
+// Extensión reporta que Copilot quiere ejecutar un tool
+app.post('/api/tool/call', (req, res) => {
+  const { callId, name, input, convId } = req.body;
+  if (!callId || !name || !convId) {
+    return res.status(400).json({ error: 'callId, name y convId son requeridos' });
+  }
+
+  let resolveResult, rejectResult;
+  const resultPromise = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult  = reject;
+  });
+
+  pendingToolCalls.set(callId, { name, input, convId, resolveResult, rejectResult, resultPromise });
+  console.log(`🔧 Tool call registrado callId=${callId} name=${name} convId=${convId}`);
+
+  // Si la app ya está en long-poll esperando tools de este convId, despacharla
+  const callerList = waitingToolCallers.get(convId);
+  if (callerList && callerList.length > 0) {
+    const caller = callerList.shift();
+    clearTimeout(caller.timer);
+    if (callerList.length === 0) { waitingToolCallers.delete(convId); }
+    caller.resolve({ callId, name, input });
+  }
+
+  res.json({ success: true, callId });
+});
+
+// Extensión espera aquí el resultado del tool (long-poll hasta 60s)
+app.get('/api/tool/result/wait/:callId', async (req, res) => {
+  const callId = req.params.callId;
+  const tc = pendingToolCalls.get(callId);
+  if (!tc) {
+    return res.status(404).json({ error: 'Tool call no encontrado o ya resuelto' });
+  }
+
+  try {
+    const result = await Promise.race([
+      tc.resultPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 60000))
+    ]);
+    console.log(`✅ Tool result recibido callId=${callId}`);
+    res.json({ result });
+  } catch (err) {
+    pendingToolCalls.delete(callId);
+    res.status(504).json({ error: err.message === 'timeout' ? 'Timeout esperando resultado del tool' : err.message });
+  }
+});
+
+// App hace long-poll esperando tool calls pendientes para una conversación (30s)
+app.get('/api/tool/wait/:convId', (req, res) => {
+  const convId = req.params.convId;
+
+  // Buscar si ya hay un tool call pendiente para este convId
+  for (const [callId, tc] of pendingToolCalls.entries()) {
+    if (tc.convId === convId && !tc.dispatched) {
+      tc.dispatched = true;
+      return res.json({ callId, name: tc.name, input: tc.input });
+    }
+  }
+
+  // Esperar hasta 30s
+  const timer = setTimeout(() => {
+    const list = waitingToolCallers.get(convId);
+    if (list) {
+      const idx = list.findIndex(c => c.timer === timer);
+      if (idx > -1) { list.splice(idx, 1); }
+      if (list.length === 0) { waitingToolCallers.delete(convId); }
+    }
+    res.json({ callId: null }); // timeout sin tool call
+  }, 30000);
+
+  res.on('close', () => {
+    clearTimeout(timer);
+    const list = waitingToolCallers.get(convId);
+    if (list) {
+      const idx = list.findIndex(c => c.timer === timer);
+      if (idx > -1) { list.splice(idx, 1); }
+      if (list.length === 0) { waitingToolCallers.delete(convId); }
+    }
+  });
+
+  if (!waitingToolCallers.has(convId)) { waitingToolCallers.set(convId, []); }
+  waitingToolCallers.get(convId).push({ resolve: (tc) => res.json(tc), timer });
+});
+
+// App envía el resultado de ejecutar el tool
+app.post('/api/tool/result/:callId', (req, res) => {
+  const callId = req.params.callId;
+  const { result, error } = req.body;
+
+  const tc = pendingToolCalls.get(callId);
+  if (!tc) {
+    return res.status(404).json({ error: 'Tool call no encontrado o ya resuelto' });
+  }
+
+  if (error) {
+    tc.rejectResult(new Error(error));
+  } else {
+    tc.resolveResult(result !== undefined ? result : null);
+  }
+
+  pendingToolCalls.delete(callId);
+  console.log(`📨 Tool result guardado callId=${callId}`);
+  res.json({ success: true });
 });
 
 // Enviar prompt al servidor para que lo procese la extensión
@@ -913,7 +1084,8 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, top_p, max_tokens, stream,
-            thread_id, justification, extract_json, save_last_message_only, max_input_tokens } = req.body;
+            thread_id, justification, extract_json, save_last_message_only, max_input_tokens,
+            tools } = req.body;
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: { message: 'messages is required and must be a non-empty array', type: 'invalid_request_error' } });
@@ -962,6 +1134,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       systemPrompt:         systemPrompt,
       maxInputTokens:       max_input_tokens || null,
       images:               images.length ? images : undefined,
+      tools:                Array.isArray(tools) && tools.length ? tools : undefined,
     };
 
     console.log(`[v1] /chat/completions model=${data.modelFamily} thread=${conversationId || 'new'}`);
