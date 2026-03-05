@@ -189,8 +189,32 @@ async function executePromptRequest(data, res) {
 
   activeCount++;
   broadcastStatus();
-  console.log(`🔒 Encolando prompt convId=${convId} (activos=${activeCount}, cola=${promptQueue.length})`);
 
+  // Crear el Promise y extraer resolve/reject ANTES de despachar al worker
+  // Evita race condition: si Copilot responde muy rápido, /api/save puede llegar
+  // antes de que el resolver esté registrado en pendingResolvers
+  let resolvePromise, rejectPromise;
+  const pendingPromise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise  = reject;
+  });
+
+  const processingTimeout = setTimeout(() => {
+    if (pendingResolvers.has(convId)) {
+      pendingResolvers.delete(convId);
+      const idx = promptQueue.findIndex(p => p.id === convId);
+      if (idx > -1) { promptQueue.splice(idx, 1); }
+      activeCount = Math.max(0, activeCount - 1);
+      broadcastStatus();
+      console.warn(`⏱ PROCESSING_TIMEOUT convId=${convId}`);
+      rejectPromise(new Error('Timeout: la extensión no respondió en 5 minutos'));
+    }
+  }, PROCESSING_TIMEOUT);
+
+  // Registrar en el map ANTES del dispatch
+  pendingResolvers.set(convId, { resolve: resolvePromise, reject: rejectPromise, timeoutId: processingTimeout });
+
+  console.log(`🔒 Encolando prompt convId=${convId} (activos=${activeCount}, cola=${promptQueue.length})`);
   promptQueue.push(data);
   dispatchNextToWorker();
 
@@ -200,27 +224,12 @@ async function executePromptRequest(data, res) {
     if (!responded) {
       responded = true;
       console.warn(`⏱ HTTP timeout convId=${convId} — respondiendo 504`);
-      res.status(504).json({ error: 'Timeout: la IA no respondió en 2 minutos. La tarea sigue procesándose.' });
+      res.status(504).json({ error: 'Timeout: la IA no respondió en 4 minutos. La tarea sigue procesándose.' });
     }
   }, HTTP_TIMEOUT);
 
   try {
-    await new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        if (pendingResolvers.has(convId)) {
-          pendingResolvers.delete(convId);
-          // También remover de la cola si aún no fue tomado
-          const idx = promptQueue.findIndex(p => p.id === convId);
-          if (idx > -1) { promptQueue.splice(idx, 1); }
-          activeCount = Math.max(0, activeCount - 1);
-          broadcastStatus();
-          console.warn(`⏱ PROCESSING_TIMEOUT convId=${convId}`);
-          reject(new Error('Timeout: la extensión no respondió en 3 minutos'));
-        }
-      }, PROCESSING_TIMEOUT);
-
-      pendingResolvers.set(convId, { resolve, reject, timeoutId });
-    });
+    await pendingPromise;
 
     clearTimeout(httpTimeout);
     console.log(`✅ Tarea completada convId=${convId}`);
