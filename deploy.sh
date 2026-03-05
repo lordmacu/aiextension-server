@@ -31,6 +31,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 SERVER_HOST=100.24.49.190
 SERVER_PORT=22
 SERVER_USER=bitnami
+SERVER_REPO=/home/bitnami/aiextension
 SERVER_PATH=/home/bitnami/aiextension/test-server
 SSH_KEY=/Users/cristian/finearom/finearom.pem
 GITHUB_USER=lordmacu
@@ -93,10 +94,12 @@ success "Push OK → branch: $BRANCH"
 # ── 4. Pull en servidor ───────────────────────────────────────────────────────
 log "Actualizando servidor..."
 ssh_exec "
-    cd '$SERVER_PATH'
+    cd '$SERVER_REPO'
     git remote set-url origin 'https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/aiextension-server.git'
     git fetch origin $BRANCH
     git reset --hard origin/$BRANCH
+    # Copiar server.js al directorio con node_modules
+    cp server.js '$SERVER_PATH/server.js'
     echo 'Pull OK'
 "
 success "Código actualizado en servidor"
