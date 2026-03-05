@@ -1,0 +1,13 @@
+services:
+  aiextension-server:
+    build: .
+    container_name: aiextension-server
+    restart: unless-stopped
+    ports:
+      - "${PORT:-54321}:54321"
+    environment:
+      - PORT=54321
+      - AI_API_KEY=${AI_API_KEY:-finearom-ai-2025}
+    volumes:
+      - ./conversations:/app/conversations
+      - ./images:/app/images
